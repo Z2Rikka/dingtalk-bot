@@ -1,0 +1,27 @@
+# 环境变量配置
+.env
+
+# 依赖目录
+node_modules/
+
+# 下载的文件
+received_documents/
+
+# 日志文件
+download_log.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
