@@ -222,15 +222,30 @@ async function downloadFile(content, fileName, msgData) {
 
 // ============ 发送消息 ============
 
-async function sendText(conversationId, text, conversationType = '1', customRobotId = null) {
-  const token = await getToken();
+// 使用 sessionWebhook 发送消息（推荐方式）
+async function sendText(conversationId, text, conversationType = '1', customRobotId = null, sessionWebhook = null) {
+  // 优先使用 sessionWebhook（临时回调地址，无需额外认证）
+  if (sessionWebhook) {
+    try {
+      console.log('   使用 sessionWebhook 发送消息');
+      const response = await axios.post(sessionWebhook, {
+        msgtype: 'text',
+        text: { content: text }
+      }, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      console.log('   ✅ 已回复 (sessionWebhook):', response.data);
+      return;
+    } catch (e) {
+      console.log('   ⚠️ sessionWebhook 失败:', e.message);
+    }
+  }
   
-  // 尝试多个可能的 API
+  // 如果没有 sessionWebhook，尝试 API
+  const token = await getToken();
   const apisToTry = [
-    // 私聊发送消息
     { url: 'https://api.dingtalk.com/v1.0/robot/message/send', robotId: config.appKey },
     { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: config.appKey },
-    // 使用新的 IM API
     { url: 'https://api.dingtalk.com/v2/im/robot/send', robotId: config.appKey },
   ];
   
@@ -255,11 +270,11 @@ async function sendText(conversationId, text, conversationType = '1', customRobo
       return;
     } catch (e) {
       console.log('   ❌ 失败:', e.response?.status, e.response?.data?.code || e.message);
-      if (e.response?.status === 404) continue; // 尝试下一个
+      if (e.response?.status === 404) continue;
     }
   }
   
-  console.log('   ⚠️ 所有发送消息API都失败');
+  console.log('   ⚠️ 所有发送消息方式都失败');
 }
 
 // ============ 处理消息 ============
@@ -279,6 +294,8 @@ async function processMessage(msg, res) {
   // 从消息中提取会话信息
   const conversationId = msg.conversationId || msg.openConversationId;
   const conversationType = msg.conversationType || (msg.isGroup ? '2' : '1');
+  const sessionWebhook = msg.sessionWebhook;  // 重要！用于回复消息
+  if (sessionWebhook) console.log('   sessionWebhook:', sessionWebhook.substring(0, 50) + '...');
   
   // robotCode 就是 appKey
   const robotCode = config.appKey;
@@ -297,13 +314,13 @@ async function processMessage(msg, res) {
     console.log('   完整content:', JSON.stringify(content));
     
     if (!isAllowed(fileName)) {
-      await sendText(conversationId, '⚠️ 不支持此格式', conversationType, robotCode);
+      await sendText(conversationId, '⚠️ 不支持此格式', conversationType, robotCode, sessionWebhook);
       return;
     }
     
     if (!content.downloadCode) {
       console.log('   ❌ 没有downloadCode');
-      await sendText(conversationId, '❌ 无法获取下载凭证', conversationType, robotCode);
+      await sendText(conversationId, '❌ 无法获取下载凭证', conversationType, robotCode, sessionWebhook);
       return;
     }
     
@@ -317,30 +334,30 @@ async function processMessage(msg, res) {
       logs.unshift({ type: 'file', originalName: result.original, fileName: result.name, size: sizeMB, date: result.date, timestamp: new Date().toISOString() });
       saveLog(logs);
       
-      await sendText(conversationId, `✅ 已保存！\n\n文件名: ${result.original}\n大小: ${sizeMB} MB\n日期: ${result.date}`, conversationType, robotCode);
+      await sendText(conversationId, `✅ 已保存！\n\n文件名: ${result.original}\n大小: ${sizeMB} MB\n日期: ${result.date}`, conversationType, robotCode, sessionWebhook);
     } catch (e) {
       console.log(`   ❌ 失败: ${e.message}`);
-      await sendText(conversationId, `❌ 下载失败: ${e.message.substring(0, 50)}`, conversationType, robotCode);
+      await sendText(conversationId, `❌ 下载失败: ${e.message.substring(0, 50)}`, conversationType, robotCode, sessionWebhook);
     }
   }
   else if (msg.msgtype === 'text') {
     const text = typeof msg.text === 'string' ? msg.text : (msg.text?.content || '').trim();
     console.log(`   文本: ${text}`);
     
-    if (text === '/帮助') await sendText(conversationId, '📖 发送文档自动保存\n支持: PDF,Word,Excel,MD\n\n命令: /状态 /列表', conversationType, robotCode);
+    if (text === '/帮助') await sendText(conversationId, '📖 发送文档自动保存\n支持: PDF,Word,Excel,MD\n\n命令: /状态 /列表', conversationType, robotCode, sessionWebhook);
     else if (text === '/状态') {
       const logs = loadLog().filter(l => l.type === 'file');
       const total = logs.reduce((s, l) => s + parseFloat(l.size || 0), 0).toFixed(2);
-      await sendText(conversationId, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${total} MB`, conversationType, robotCode);
+      await sendText(conversationId, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${total} MB`, conversationType, robotCode, sessionWebhook);
     }
     else if (text === '/列表') {
       const logs = loadLog().filter(l => l.type === 'file').slice(0, 10);
       let m = '📋 最近:\n\n';
       logs.forEach((l, i) => m += `${i+1}. ${l.originalName}\n${l.size}MB | ${l.date}\n\n`);
-      await sendText(conversationId, m || '暂无', conversationType, robotCode);
+      await sendText(conversationId, m || '暂无', conversationType, robotCode, sessionWebhook);
     }
     else {
-      await sendText(conversationId, '收到！发送文件自动保存', conversationType, robotCode);
+      await sendText(conversationId, '收到！发送文件自动保存', conversationType, robotCode, sessionWebhook);
     }
   }
   else {
