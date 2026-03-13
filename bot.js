@@ -24,7 +24,7 @@ const botConfig = {
 
 const storageConfig = {
   baseDir: process.env.STORAGE_BASE_DIR || './received_documents',
-  allowedExtensions: ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.csv', '.zip', '.rar']
+  allowedExtensions: ['.pdf', '.doc', '.docx', '.docm', '.xls', '.xlsx', '.xlsm', '.ppt', '.pptx', '.txt', '.csv', '.md', '.json', '.xml', '.zip', '.rar']
 };
 
 if (!botConfig.appKey || !botConfig.appSecret || !botConfig.agentId) {
