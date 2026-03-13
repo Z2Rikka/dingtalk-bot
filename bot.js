@@ -1,5 +1,5 @@
 /**
- * 钉钉文档收集机器人 - Stream模式
+ * 钉钉文档收集机器人 - Stream模式 (正确版)
  */
 
 require('dotenv').config();
@@ -9,7 +9,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { EventEmitter } = require('events');
+const WebSocket = require('ws');
 
 // ============ 配置 ============
 
@@ -37,6 +37,11 @@ app.use(express.json());
 const baseDir = path.resolve(config.storageDir);
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
 
+// ============ 常量 ============
+
+const GATEWAY_URL = 'https://api.dingtalk.com/v1.0/robot/oToMessages/getWebsocketEndpoint';
+const TOKEN_URL = 'https://api.dingtalk.com/v1.0/oauth2/accessToken';
+
 // ============ 工具函数 ============
 
 function getToday() {
@@ -50,13 +55,14 @@ async function getToken() {
   const now = Date.now();
   if (tokenCache.token && now < tokenCache.expire) return tokenCache.token;
   
-  const res = await axios.post('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
+  const res = await axios.post(TOKEN_URL, {
     appKey: config.appKey,
     appSecret: config.appSecret
   });
   
   tokenCache.token = res.data.accessToken;
   tokenCache.expire = now + (res.data.expireIn - 300) * 1000;
+  console.log('🔑 获取Token');
   return tokenCache.token;
 }
 
@@ -124,8 +130,9 @@ async function sendText(conversationId, text, conversationType = '1') {
       msgtype: 'text',
       text: { content: text }
     }, { headers: { 'x-acs-dingtalk-access-token': token } });
+    console.log('   ✅ 已回复');
   } catch (e) {
-    console.log('发送失败:', e.message);
+    console.log('   ⚠️ 回复失败:', e.message);
   }
 }
 
@@ -195,50 +202,79 @@ async function onMessage(msg) {
 
 // ============ Stream 模式 ============
 
-const WebSocket = require('ws');
+const subscriptions = [
+  { type: 'EVENT', topic: 'im.message.receive' },
+  { type: 'CALLBACK', topic: 'im.file.uploaded' }
+];
 
 async function startStream() {
-  const token = await getToken();
-  
-  // 获取 websocket 地址
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/getWebsocketEndpoint', 
-    { robotCode: config.agentId },
-    { headers: { 'x-acs-dingtalk-access-token': token } }
-  );
-  
-  const endpoint = res.data.endpoint;
-  console.log(`🔗 连接Stream: ${endpoint}`);
-  
-  const ws = new WebSocket(endpoint);
-  
-  ws.on('open', () => {
-    console.log('✅ Stream 连接成功\n');
-  });
-  
-  ws.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      console.log('收到消息:', msg.topic);
-      
-      if (msg.topic === 'cloudimap.message.receive') {
-        const content = msg.data;
-        if (content && content.msgtype) {
-          await onMessage(content);
-        }
-      }
-    } catch (e) {
-      console.log('解析消息失败:', e.message);
+  try {
+    // 获取 websocket 连接
+    const res = await axios.post(GATEWAY_URL, {
+      clientId: config.appKey,
+      clientSecret: config.appSecret,
+      subscriptions: subscriptions
+    }, {
+      headers: { 'Accept': 'application/json' }
+    });
+    
+    console.log('📡 Gateway返回:', JSON.stringify(res.data).substring(0, 200));
+    
+    const { endpoint, ticket } = res.data;
+    if (!endpoint || !ticket) {
+      throw new Error('endpoint或ticket为空');
     }
-  });
-  
-  ws.on('error', (e) => {
-    console.log('❌ Stream错误:', e.message);
-  });
-  
-  ws.on('close', () => {
-    console.log('🔄 Stream断开，5秒后重连...');
+    
+    const wsUrl = `${endpoint}?ticket=${ticket}`;
+    console.log(`🔗 连接: ${wsUrl.substring(0, 80)}...`);
+    
+    const ws = new WebSocket(wsUrl);
+    
+    ws.on('open', () => {
+      console.log('✅ Stream 连接成功\n');
+    });
+    
+    ws.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        console.log('📨 类型:', msg.type, '主题:', msg.headers?.topic);
+        
+        if (msg.type === 'EVENT' && msg.headers?.topic === 'im.message.receive') {
+          const content = JSON.parse(msg.data);
+          if (content && content.msgtype) {
+            await onMessage(content);
+          }
+        }
+        else if (msg.type === 'CALLBACK') {
+          console.log('📨 回调:', msg.headers?.topic);
+        }
+        
+        // 响应ACK
+        ws.send(JSON.stringify({
+          code: 200,
+          headers: { messageId: msg.headers?.messageId },
+          message: 'OK'
+        }));
+        
+      } catch (e) {
+        console.log('解析失败:', e.message);
+      }
+    });
+    
+    ws.on('error', (e) => {
+      console.log('❌ 错误:', e.message);
+    });
+    
+    ws.on('close', () => {
+      console.log('🔄 断开，5秒后重连...');
+      setTimeout(startStream, 5000);
+    });
+    
+  } catch (e) {
+    console.error('❌ 启动失败:', e.message);
+    console.log('5秒后重试...');
     setTimeout(startStream, 5000);
-  });
+  }
 }
 
 // ============ HTTP 服务器 ============
@@ -250,8 +286,6 @@ app.listen(config.port, '0.0.0.0', () => {
 });
 
 // 启动 Stream
-startStream().catch(err => {
-  console.error('❌ Stream启动失败:', err.message);
-});
+startStream();
 
 module.exports = app;
