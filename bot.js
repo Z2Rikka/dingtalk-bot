@@ -197,57 +197,55 @@ async function onMessage(msg) {
 
 // ============ Stream 模式 ============
 
+let reconnectTimer = null;
+let isConnected = false;
+
 const client = new DWClient({
   clientId: config.appKey,
   clientSecret: config.appSecret,
 });
 
-// 处理消息事件
-const onEventReceived = (event) => {
-  console.log('📨 收到事件完整:', JSON.stringify(event).substring(0, 500));
-  console.log('   Headers:', JSON.stringify(event.headers));
-  console.log('   Data:', event.data?.substring(0, 200));
-  
-  try {
-    // im.message.receive 是接收消息事件
-    if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
-      let content;
-      
-      // 尝试多种方式解析数据
-      if (typeof event.data === 'string') {
-        try {
-          content = JSON.parse(event.data);
-        } catch {
-          content = event.data;
-        }
-      } else if (typeof event.data === 'object') {
-        content = event.data;
+function connect() {
+  client
+    .registerAllEventListener(onEventReceived)
+    .connect()
+    .then(() => {
+      console.log('✅ Stream 连接成功');
+      isConnected = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-      
-      console.log('   解析后消息:', JSON.stringify(content).substring(0, 200));
-      console.log('   消息类型:', content?.msgtype);
-      
-      if (content && content.msgtype) {
-        onMessage(content);
-      }
-    }
-  } catch (e) {
-    console.log('   解析错误:', e.message);
-  }
-  
-  return { status: EventAck.SUCCESS, message: 'OK' };
-};
+    })
+    .catch((err) => {
+      console.error('❌ Stream 连接失败:', err.message);
+      isConnected = false;
+      scheduleReconnect();
+    });
+}
 
-// 注册事件监听并连接
-client
-  .registerAllEventListener(onEventReceived)
-  .connect()
-  .then(() => {
-    console.log('✅ Stream 连接成功\n');
-  })
-  .catch((err) => {
-    console.error('❌ Stream 连接失败:', err.message);
-  });
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  console.log('⏰ 5秒后尝试重连...');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, 5000);
+}
+
+client.on('close', () => {
+  console.log('❌ Stream 连接已关闭，准备重连...');
+  isConnected = false;
+  scheduleReconnect();
+});
+
+client.on('error', (err) => {
+  console.error('❌ Stream 错误:', err.message);
+  isConnected = false;
+  scheduleReconnect();
+});
+
+connect();
 
 // ============ HTTP 服务器 ============
 
