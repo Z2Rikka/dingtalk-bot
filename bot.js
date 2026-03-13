@@ -205,6 +205,36 @@ const client = new DWClient({
   clientSecret: config.appSecret,
 });
 
+const onEventReceived = (event) => {
+  console.log('📨 收到事件:', event.headers?.topic);
+  
+  try {
+    if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
+      let content;
+      
+      if (typeof event.data === 'string') {
+        try {
+          content = JSON.parse(event.data);
+        } catch {
+          content = event.data;
+        }
+      } else if (typeof event.data === 'object') {
+        content = event.data;
+      }
+      
+      console.log('   消息类型:', content?.msgtype);
+      
+      if (content && content.msgtype) {
+        onMessage(content);
+      }
+    }
+  } catch (e) {
+    console.log('   解析错误:', e.message);
+  }
+  
+  return { status: EventAck.SUCCESS, message: 'OK' };
+};
+
 function connect() {
   client
     .registerAllEventListener(onEventReceived)

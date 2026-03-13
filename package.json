@@ -2,10 +2,10 @@
   "name": "dingtalk-document-collector",
   "version": "1.0.0",
   "description": "钉钉文档收集机器人 - 监听群消息/私聊，下载文档到服务器",
-  "main": "bot.ts",
+  "main": "bot.js",
   "scripts": {
-    "start": "npx ts-node --esm ./bot.ts",
-    "dev": "nodemon ./bot.ts"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
