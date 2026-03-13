@@ -1,5 +1,5 @@
 /**
- * 钉钉文档收集机器人 - Stream模式 (正确版)
+ * 钉钉文档收集机器人 - Stream模式 (官方SDK版)
  */
 
 require('dotenv').config();
@@ -9,7 +9,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const WebSocket = require('ws');
+const { DWClient, EventAck } = require('dingtalk-stream');
 
 // ============ 配置 ============
 
@@ -37,11 +37,6 @@ app.use(express.json());
 const baseDir = path.resolve(config.storageDir);
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
 
-// ============ 常量 ============
-
-const GATEWAY_URL = 'https://api.dingtalk.com/v1.0/robot/oToMessages/getWebsocketEndpoint';
-const TOKEN_URL = 'https://api.dingtalk.com/v1.0/oauth2/accessToken';
-
 // ============ 工具函数 ============
 
 function getToday() {
@@ -55,7 +50,7 @@ async function getToken() {
   const now = Date.now();
   if (tokenCache.token && now < tokenCache.expire) return tokenCache.token;
   
-  const res = await axios.post(TOKEN_URL, {
+  const res = await axios.post('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
     appKey: config.appKey,
     appSecret: config.appSecret
   });
@@ -202,80 +197,42 @@ async function onMessage(msg) {
 
 // ============ Stream 模式 ============
 
-const subscriptions = [
-  { type: 'EVENT', topic: 'im.message.receive' },
-  { type: 'CALLBACK', topic: 'im.file.uploaded' }
-];
+const client = new DWClient({
+  clientId: config.appKey,
+  clientSecret: config.appSecret,
+});
 
-async function startStream() {
+// 处理消息事件
+const onEventReceived = (event) => {
+  console.log('📨 收到事件:', event.headers?.topic, event.headers?.eventType);
+  
   try {
-    // 获取 websocket 连接
-    const res = await axios.post(GATEWAY_URL, {
-      clientId: config.appKey,
-      clientSecret: config.appSecret,
-      subscriptions: subscriptions
-    }, {
-      headers: { 'Accept': 'application/json' }
-    });
-    
-    console.log('📡 Gateway返回:', JSON.stringify(res.data).substring(0, 200));
-    
-    const { endpoint, ticket } = res.data;
-    if (!endpoint || !ticket) {
-      throw new Error('endpoint或ticket为空');
-    }
-    
-    const wsUrl = `${endpoint}?ticket=${ticket}`;
-    console.log(`🔗 连接: ${wsUrl.substring(0, 80)}...`);
-    
-    const ws = new WebSocket(wsUrl);
-    
-    ws.on('open', () => {
-      console.log('✅ Stream 连接成功\n');
-    });
-    
-    ws.on('message', async (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        console.log('📨 类型:', msg.type, '主题:', msg.headers?.topic);
-        
-        if (msg.type === 'EVENT' && msg.headers?.topic === 'im.message.receive') {
-          const content = JSON.parse(msg.data);
-          if (content && content.msgtype) {
-            await onMessage(content);
-          }
-        }
-        else if (msg.type === 'CALLBACK') {
-          console.log('📨 回调:', msg.headers?.topic);
-        }
-        
-        // 响应ACK
-        ws.send(JSON.stringify({
-          code: 200,
-          headers: { messageId: msg.headers?.messageId },
-          message: 'OK'
-        }));
-        
-      } catch (e) {
-        console.log('解析失败:', e.message);
+    // im.message.receive 是接收消息事件
+    if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
+      const content = JSON.parse(event.data);
+      console.log('   消息类型:', content.msgtype);
+      
+      if (content && content.msgtype) {
+        onMessage(content);
       }
-    });
-    
-    ws.on('error', (e) => {
-      console.log('❌ 错误:', e.message);
-    });
-    
-    ws.on('close', () => {
-      console.log('🔄 断开，5秒后重连...');
-      setTimeout(startStream, 5000);
-    });
-    
+    }
   } catch (e) {
-    console.error('❌ 启动失败:', e.message);
-    console.log('5秒后重试...');
-    setTimeout(startStream, 5000);
+    console.log('   解析错误:', e.message);
   }
-}
+  
+  return { status: EventAck.SUCCESS, message: 'OK' };
+};
+
+// 注册事件监听并连接
+client
+  .registerAllEventListener(onEventReceived)
+  .connect()
+  .then(() => {
+    console.log('✅ Stream 连接成功\n');
+  })
+  .catch((err) => {
+    console.error('❌ Stream 连接失败:', err.message);
+  });
 
 // ============ HTTP 服务器 ============
 
@@ -284,8 +241,5 @@ app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'stream' }));
 app.listen(config.port, '0.0.0.0', () => {
   console.log(`🤖 文档收集助手 | 端口: ${config.port}\n`);
 });
-
-// 启动 Stream
-startStream();
 
 module.exports = app;
