@@ -201,7 +201,7 @@ async function downloadFile(content, fileName, msgData) {
     if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
     
     const ext = path.extname(fileName);
-    const finalName = `${Date.now()}_${crypto.randomBytes(4).toHexString()}_${safeName(path.basename(fileName, ext))}${ext}`;
+    const finalName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${safeName(path.basename(fileName, ext))}${ext}`;
     const filePath = path.join(dateDir, finalName);
     
     return new Promise((resolve, reject) => {
@@ -227,9 +227,11 @@ async function sendText(conversationId, text, conversationType = '1', customRobo
   
   // 尝试多个可能的 API
   const apisToTry = [
-    { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: customRobotId || config.appKey },
-    { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: config.agentId },
-    { url: 'https://api.dingtalk.com/v1.0/im/v1/robot/send', robotId: customRobotId || config.appKey },
+    // 私聊发送消息
+    { url: 'https://api.dingtalk.com/v1.0/robot/message/send', robotId: config.appKey },
+    { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: config.appKey },
+    // 使用新的 IM API
+    { url: 'https://api.dingtalk.com/v2/im/robot/send', robotId: config.appKey },
   ];
   
   for (const api of apisToTry) {
