@@ -1,6 +1,6 @@
 /**
- * 钉钉文档收集机器人
- * 支持从 .env 文件读取配置
+ * 钉钉文档收集机器人 v3
+ * 修复下载和回复问题
  */
 
 require('dotenv').config();
@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// ============ 加载配置 ============
+// ============ 配置 ============
 
 const botConfig = {
   appKey: process.env.BOT_APP_KEY || '',
@@ -29,33 +29,22 @@ const storageConfig = {
     '.ppt', '.pptx', '.pptm', '.potx', '.potm',
     '.txt', '.csv', '.md', '.json', '.xml',
     '.rar', '.zip', '.7z'
-  ],
-  maxFileNameLength: parseInt(process.env.STORAGE_MAX_FILENAME_LENGTH) || 200
-};
-
-const messageConfig = {
-  autoReply: process.env.MESSAGE_AUTO_REPLY !== 'false',
-  allowedGroupIds: (process.env.MESSAGE_ALLOWED_GROUP_IDS || '').split(',').filter(Boolean)
+  ]
 };
 
 const logConfig = {
   enabled: process.env.LOG_ENABLED !== 'false',
-  file: process.env.LOG_FILE || './download_log.json',
-  maxEntries: parseInt(process.env.LOG_MAX_ENTRIES) || 1000
+  file: process.env.LOG_FILE || './download_log.json'
 };
 
-// ============ 验证配置 ============
-
+// 验证配置
 if (!botConfig.appKey || !botConfig.appSecret || !botConfig.agentId) {
-  console.error('❌ 配置错误：BOT_APP_KEY、BOT_APP_SECRET、BOT_AGENT_ID 必须填写！');
-  console.error('请编辑 .env 文件配置这些值。');
+  console.error('❌ 请先配置 .env 文件中的 BOT_APP_KEY、BOT_APP_SECRET、BOT_AGENT_ID');
   process.exit(1);
 }
 
 console.log('✅ 配置加载成功');
-console.log(`   AppKey: ${botConfig.appKey.substring(0, 8)}...`);
 console.log(`   AgentId: ${botConfig.agentId}`);
-console.log(`   端口: ${botConfig.port}`);
 
 // ============ 常量 ============
 
@@ -63,22 +52,14 @@ const TIMEZONE_OFFSET = 8 * 60 * 60 * 1000;
 const app = express();
 app.use(express.json());
 
-// ============ 初始化目录 ============
+// ============ 初始化 ============
 
 const baseDir = path.resolve(storageConfig.baseDir);
-if (!fs.existsSync(baseDir)) {
-  fs.mkdirSync(baseDir, { recursive: true });
-}
+if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
 
 const logFile = path.resolve(logConfig.file);
 
 // ============ 工具函数 ============
-
-function ensureDir(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-}
 
 function getCurrentDate() {
   return new Date(Date.now() + TIMEZONE_OFFSET);
@@ -90,223 +71,228 @@ function formatDate(date) {
 
 async function getAccessToken() {
   const url = 'https://api.dingtalk.com/v1.0/oauth2/accessToken';
-  const response = await axios.post(url, {
+  const res = await axios.post(url, {
     appKey: botConfig.appKey,
     appSecret: botConfig.appSecret
   });
-  return response.data.accessToken;
+  return res.data.accessToken;
 }
 
 function loadLog() {
   if (!logConfig.enabled) return [];
-  try {
-    if (fs.existsSync(logFile)) {
-      return JSON.parse(fs.readFileSync(logFile, 'utf-8'));
-    }
-  } catch (e) {}
-  return [];
+  try { return fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf-8')) : []; } catch { return []; }
 }
 
 function saveLog(logs) {
   if (!logConfig.enabled) return;
-  try {
-    fs.writeFileSync(logFile, JSON.stringify(logs, null, 2));
-  } catch (e) {}
+  try { fs.writeFileSync(logFile, JSON.stringify(logs, null, 2)); } catch {}
 }
 
 function addLog(entry) {
   const logs = loadLog();
   logs.unshift({ ...entry, timestamp: new Date().toISOString() });
-  if (logs.length > logConfig.maxEntries) logs.length = logConfig.maxEntries;
   saveLog(logs);
 }
 
 function isAllowedExtension(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-  return storageConfig.allowedExtensions.includes(ext);
-}
-
-function getExtension(fileName) {
-  return path.extname(fileName).toLowerCase();
+  return storageConfig.allowedExtensions.includes(path.extname(fileName).toLowerCase());
 }
 
 function sanitizeFileName(fileName) {
-  let safeName = fileName.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
-  const ext = getExtension(safeName);
-  const baseName = path.basename(safeName, ext);
-  if (baseName.length > storageConfig.maxFileNameLength - ext.length) {
-    safeName = baseName.substring(0, storageConfig.maxFileNameLength - ext.length) + ext;
-  }
-  return safeName;
+  return fileName.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
 }
 
-function generateFileName(originalName) {
-  const safeName = sanitizeFileName(originalName);
-  return `${Date.now()}_${crypto.randomBytes(4).toHexString()}_${safeName}`;
-}
+// ============ 下载文件 ============
 
-function getDateDir() {
-  const dateStr = formatDate(getCurrentDate());
-  const dateDir = path.join(baseDir, dateStr);
-  ensureDir(dateDir);
-  return dateDir;
-}
-
-function getStoragePath(fileName) {
-  if (!isAllowedExtension(fileName)) {
-    throw new Error(`不支持的格式: ${getExtension(fileName)}`);
-  }
-  return path.join(getDateDir(), generateFileName(fileName));
-}
-
-async function downloadFileWithCode(downloadCode, fileName, accessToken) {
+async function downloadFile(downloadCode, originalName, accessToken) {
+  // 方法1: 使用官方文档的API
   const url = 'https://api.dingtalk.com/v1.0/robot/message/files/downloadByTmpCode';
   
-  const response = await axios.post(url, {
-    tmpCode: downloadCode
-  }, {
-    headers: { 
-      'x-acs-dingtalk-access-token': accessToken,
-      'Content-Type': 'application/json'
-    },
-    responseType: 'stream'
-  });
+  console.log(`📥 开始下载: ${originalName}`);
   
-  if (!isAllowedExtension(fileName)) {
-    throw new Error(`不支持的格式: ${getExtension(fileName)}`);
-  }
-  
-  const filePath = getStoragePath(fileName);
-  
-  return new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(filePath);
-    response.data.pipe(writer);
-    writer.on('finish', () => {
-      const stats = fs.statSync(filePath);
-      resolve({
-        path: filePath,
-        name: path.basename(filePath),
-        originalName: fileName,
-        size: stats.size,
-        dateDir: path.basename(path.dirname(filePath))
-      });
+  try {
+    const response = await axios.post(url, {
+      tmpCode: downloadCode
+    }, {
+      headers: { 
+        'x-acs-dingtalk-access-token': accessToken,
+        'Content-Type': 'application/json'
+      },
+      responseType: 'stream'
     });
-    writer.on('error', reject);
-  });
+    
+    // 检查是否是错误响应
+    if (response.headers['content-type'] && response.headers['content-type'].includes('application/json')) {
+      // 读取错误响应
+      const chunks = [];
+      for await (const chunk of response.data) {
+        chunks.push(chunk);
+      }
+      const errorBody = Buffer.concat(chunks).toString();
+      console.log('❌ 下载失败，返回JSON:', errorBody);
+      throw new Error(errorBody);
+    }
+    
+    // 验证格式
+    if (!isAllowedExtension(originalName)) {
+      throw new Error(`不支持的格式: ${path.extname(originalName)}`);
+    }
+    
+    // 保存文件
+    const dateDir = path.join(baseDir, formatDate(getCurrentDate()));
+    if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
+    
+    const ext = path.extname(originalName);
+    const safeName = sanitizeFileName(path.basename(originalName, ext));
+    const fileName = `${Date.now()}_${crypto.randomBytes(4).toHexString()}_${safeName}${ext}`;
+    const filePath = path.join(dateDir, fileName);
+    
+    return new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(filePath);
+      response.data.pipe(writer);
+      writer.on('finish', () => {
+        const stats = fs.statSync(filePath);
+        resolve({
+          path: filePath,
+          name: fileName,
+          originalName: originalName,
+          size: stats.size,
+          dateDir: formatDate(getCurrentDate())
+        });
+      });
+      writer.on('error', reject);
+    });
+  } catch (error) {
+    console.log('❌ 下载错误:', error.message);
+    throw error;
+  }
 }
 
-async function sendMessage(targetId, targetType, content) {
-  if (!messageConfig.autoReply) return;
+// ============ 发送消息 ============
+
+async function sendMessageBySession(sessionWebhook, content) {
+  if (!sessionWebhook) {
+    console.log('⚠️ 没有sessionWebhook，无法回复');
+    return;
+  }
+  
   try {
-    const accessToken = await getAccessToken();
-    const url = targetType === 'group' 
-      ? 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend'
-      : 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
-    
-    await axios.post(url, {
-      robotId: botConfig.agentId,
-      openConversationId: targetId,
+    await axios.post(sessionWebhook, {
       msgtype: 'text',
       text: { content }
-    }, { headers: { 'x-acs-dingtalk-access-token': accessToken } });
-  } catch (e) {
-    console.error('发送消息失败:', e.message);
+    });
+    console.log('✅ 消息已发送');
+  } catch (error) {
+    console.log('❌ 发送消息失败:', error.response?.data || error.message);
   }
 }
 
-function getAllowedFormatsList() {
-  const formats = new Set();
-  storageConfig.allowedExtensions.forEach(ext => {
-    formats.add(ext.replace('.', '').toUpperCase());
-  });
-  return Array.from(formats).join(', ');
-}
-
-// ============ 处理文件消息 ============
-
-async function handleFileMessage(message, accessToken) {
-  const content = message.content || {};
-  const fileName = content.fileName || message.fileName || 'unknown_file';
-  const downloadCode = content.downloadCode;
-  
-  console.log(`📥 收到文档: ${fileName}`);
-  console.log(`   downloadCode: ${downloadCode ? '有' : '无'}`);
-  
-  const targetType = message.conversationType === '2' ? 'group' : 'private';
-  
-  // 验证格式
-  if (!isAllowedExtension(fileName)) {
-    const formats = getAllowedFormatsList();
-    await sendMessage(message.conversationId, targetType, 
-      `⚠️ 不支持此格式，仅支持: ${formats}`);
-    
-    addLog({ type: 'rejected', reason: 'unsupported_format', originalName: fileName, conversationId: message.conversationId });
-    return null;
+async function sendReply(message, content) {
+  // 优先使用 sessionWebhook（私聊用这个更可靠）
+  if (message.sessionWebhook) {
+    return await sendMessageBySession(message.sessionWebhook, content);
   }
   
-  if (!downloadCode) {
-    console.log('❌ 没有 downloadCode');
-    await sendMessage(message.conversationId, targetType, '❌ 文件下载失败：无法获取下载凭证');
-    return null;
+  // 否则使用 openConversationId
+  if (message.conversationId) {
+    try {
+      const accessToken = await getAccessToken();
+      const url = message.conversationType === '2' 
+        ? 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend'
+        : 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
+      
+      await axios.post(url, {
+        robotId: botConfig.agentId,
+        openConversationId: message.conversationId,
+        msgtype: 'text',
+        text: { content }
+      }, {
+        headers: { 'x-acs-dingtalk-access-token': accessToken }
+      });
+      console.log('✅ 消息已发送');
+    } catch (error) {
+      console.log('❌ 发送消息失败:', error.response?.data || error.message);
+    }
   }
-  
-  // 下载
-  const result = await downloadFileWithCode(downloadCode, fileName, accessToken);
-  const fileSizeMB = (result.size / 1024 / 1024).toFixed(2);
-  
-  console.log(`✅ 保存成功: ${result.name} (${fileSizeMB} MB)`);
-  
-  addLog({
-    type: 'file',
-    fileName: result.name,
-    originalName: result.originalName,
-    fileSize: fileSizeMB,
-    dateDir: result.dateDir,
-    conversationId: message.conversationId,
-    senderNick: message.senderNick
-  });
-  
-  await sendMessage(message.conversationId, targetType, 
-    `✅ 文档已保存\n\n文件名: ${result.originalName}\n大小: ${fileSizeMB} MB\n日期: ${result.dateDir}`);
-  
-  return result;
 }
 
-// ============ 消息处理 ============
+// ============ 处理消息 ============
 
 async function handleMessage(message) {
-  console.log(`\n📩 消息: ${message.msgtype} | 会话类型: ${message.conversationType} | 发送者: ${message.senderNick || message.senderId}`);
+  console.log(`\n📩 消息: ${message.msgtype} | 类型: ${message.conversationType === '2' ? '群聊' : '私聊'}`);
+  console.log(`   sessionWebhook: ${message.sessionWebhook ? '有' : '无'}`);
+  console.log(`   conversationId: ${message.conversationId ? '有' : '无'}`);
   
   const accessToken = await getAccessToken();
-  const targetType = message.conversationType === '2' ? 'group' : 'private';
   
+  // 处理文件消息
   if (message.msgtype === 'file') {
-    return await handleFileMessage(message, accessToken);
+    const content = message.content || {};
+    const fileName = content.fileName || message.fileName || '未知文件';
+    const downloadCode = content.downloadCode;
+    
+    console.log(`📄 文件: ${fileName}`);
+    console.log(`🔑 downloadCode: ${downloadCode ? '有' : '无'}`);
+    
+    // 检查格式
+    if (!isAllowedExtension(fileName)) {
+      const formats = storageConfig.allowedExtensions.map(e => e.replace('.', '')).join(', ');
+      await sendReply(message, `⚠️ 不支持此格式，仅支持: ${formats}`);
+      addLog({ type: 'rejected', originalName: fileName, reason: 'unsupported_format' });
+      return;
+    }
+    
+    // 检查downloadCode
+    if (!downloadCode) {
+      await sendReply(message, '❌ 无法下载：缺少下载凭证');
+      return;
+    }
+    
+    try {
+      const result = await downloadFile(downloadCode, fileName, accessToken);
+      const sizeMB = (result.size / 1024 / 1024).toFixed(2);
+      
+      console.log(`✅ 下载成功: ${result.name} (${sizeMB} MB)`);
+      
+      addLog({
+        type: 'file',
+        originalName: result.originalName,
+        fileName: result.name,
+        size: sizeMB,
+        dateDir: result.dateDir,
+        path: result.path
+      });
+      
+      await sendReply(message, `✅ 文档已保存！\n\n文件名: ${result.originalName}\n大小: ${sizeMB} MB\n日期: ${result.dateDir}`);
+      
+    } catch (error) {
+      console.log('❌ 下载失败:', error.message);
+      await sendReply(message, `❌ 下载失败: ${error.message}`);
+    }
   }
+  // 处理文本命令
   else if (message.msgtype === 'text') {
-    const text = message.text?.content || message.text || '';
+    const text = typeof message.text === 'string' ? message.text : (message.text?.content || '');
+    console.log(`📝 文本: ${text}`);
     
     if (text === '/帮助' || text === '/help') {
-      await sendMessage(message.conversationId, targetType, 
-        '📖 文档收集助手\n\n发送文档自动保存\n支持: PDF,Word,Excel,PPT,TXT,RAR,ZIP\n\n命令: /状态 /列表 /目录 /帮助');
+      await sendReply(message, '📖 文档收集助手\n\n发送文档自动保存\n支持: PDF,Word,Excel,PPT,TXT,RAR,ZIP\n\n命令: /状态 /列表 /目录 /帮助');
     }
     else if (text === '/状态' || text === '/stats') {
       const logs = loadLog().filter(l => l.type === 'file');
-      const totalSize = logs.reduce((s, l) => s + parseFloat(l.fileSize || 0), 0);
-      await sendMessage(message.conversationId, targetType, 
-        `📊 统计\n\n文档: ${logs.length} 个\n大小: ${totalSize.toFixed(2)} MB`);
+      const totalSize = logs.reduce((s, l) => s + parseFloat(l.size || 0), 0).toFixed(2);
+      await sendReply(message, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${totalSize} MB`);
     }
     else if (text === '/列表' || text === '/list') {
       const logs = loadLog().filter(l => l.type === 'file').slice(0, 10);
       let msg = '📋 最近文档:\n\n';
-      logs.forEach((l, i) => msg += `${i+1}. ${l.originalName}\n${l.fileSize}MB | ${l.dateDir}\n\n`);
-      await sendMessage(message.conversationId, targetType, msg || '暂无');
+      logs.forEach((l, i) => msg += `${i+1}. ${l.originalName}\n${l.size}MB | ${l.dateDir}\n\n`);
+      await sendReply(message, msg || '暂无');
     }
     else if (text === '/目录' || text === '/dir') {
       try {
         const dirs = fs.readdirSync(baseDir).filter(d => /^\d{8}$/.test(d)).sort().reverse();
-        await sendMessage(message.conversationId, targetType, 
-          `📁 ${baseDir}\n\n${dirs.slice(0,10).map(d => '• ' + d).join('\n')}`);
+        await sendReply(message, `📁 ${baseDir}\n\n${dirs.slice(0,10).map(d => '• ' + d).join('\n')}`);
       } catch(e) {}
     }
   }
@@ -320,12 +306,13 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  console.log('\n========== 收到消息 ==========');
+  console.log('\n========== 收到请求 ==========');
   res.send('success');
+  
   try {
     await handleMessage(req.body);
   } catch (e) {
-    console.error('❌ 处理失败:', e.message);
+    console.error('❌ 处理错误:', e.message);
   }
   console.log('========== 处理完成 ==========\n');
 });
@@ -335,8 +322,7 @@ app.post('/webhook', async (req, res) => {
 app.get('/api/files', (req, res) => res.json({ total: loadLog().length, files: loadLog() }));
 app.get('/api/stats', (req, res) => {
   const logs = loadLog().filter(l => l.type === 'file');
-  const totalSize = logs.reduce((s, l) => s + parseFloat(l.fileSize || 0), 0);
-  res.json({ totalFiles: logs.length, totalSize: totalSize.toFixed(2), storageDir: baseDir });
+  res.json({ total: logs.length, totalSize: logs.reduce((s,l) => s + parseFloat(l.size||0), 0).toFixed(2) + ' MB' });
 });
 app.get('/health', (req, res) => res.json({ status: 'ok', name: botConfig.name, port: botConfig.port }));
 
@@ -349,8 +335,7 @@ app.listen(botConfig.port, '0.0.0.0', () => {
   console.log(`📁 目录: ${baseDir}`);
   console.log('========================================');
   console.log(`\n回调地址: http://你的IP:${botConfig.port}/webhook`);
-  console.log('支持: PDF,Word,Excel,PPT,TXT,RAR,ZIP');
-  console.log('命令: /帮助 /状态 /列表 /目录\n');
+  console.log('测试: 发送PDF文件给机器人\n');
 });
 
 module.exports = app;
