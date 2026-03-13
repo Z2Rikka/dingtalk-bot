@@ -86,14 +86,17 @@ async function downloadFile(content, fileName) {
   console.log(`📥 下载: ${fileName}`);
   
   const res = await axios.post(
-    'https://api.dingtalk.com/v1.0/robot/message/files/downloadByTmpCode',
-    { tmpCode: downloadCode },
-    { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' }, responseType: 'stream' }
+    'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
+    { downloadCode: downloadCode, robotCode: config.agentId },
+    { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
   );
   
-  if (res.headers['content-type']?.includes('application/json')) {
-    throw new Error('返回JSON错误');
+  const { downloadUrl } = res.data;
+  if (!downloadUrl) {
+    throw new Error('无法获取下载链接');
   }
+  
+  const fileRes = await axios.get(downloadUrl, { responseType: 'stream' });
   
   const dateDir = path.join(baseDir, getToday());
   if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
@@ -103,7 +106,7 @@ async function downloadFile(content, fileName) {
   const filePath = path.join(dateDir, finalName);
   
   return new Promise((resolve, reject) => {
-    res.data.pipe(fs.createWriteStream(filePath)).on('finish', () => {
+    fileRes.data.pipe(fs.createWriteStream(filePath)).on('finish', () => {
       const stats = fs.statSync(filePath);
       resolve({ name: finalName, original: fileName, size: stats.size, date: getToday() });
     }).on('error', reject);
