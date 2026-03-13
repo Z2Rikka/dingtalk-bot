@@ -204,13 +204,28 @@ const client = new DWClient({
 
 // 处理消息事件
 const onEventReceived = (event) => {
-  console.log('📨 收到事件:', event.headers?.topic, event.headers?.eventType);
+  console.log('📨 收到事件完整:', JSON.stringify(event).substring(0, 500));
+  console.log('   Headers:', JSON.stringify(event.headers));
+  console.log('   Data:', event.data?.substring(0, 200));
   
   try {
     // im.message.receive 是接收消息事件
     if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
-      const content = JSON.parse(event.data);
-      console.log('   消息类型:', content.msgtype);
+      let content;
+      
+      // 尝试多种方式解析数据
+      if (typeof event.data === 'string') {
+        try {
+          content = JSON.parse(event.data);
+        } catch {
+          content = event.data;
+        }
+      } else if (typeof event.data === 'object') {
+        content = event.data;
+      }
+      
+      console.log('   解析后消息:', JSON.stringify(content).substring(0, 200));
+      console.log('   消息类型:', content?.msgtype);
       
       if (content && content.msgtype) {
         onMessage(content);
