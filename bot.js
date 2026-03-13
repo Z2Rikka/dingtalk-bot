@@ -118,17 +118,19 @@ function decrypt(encrypted, aesKey, token) {
 
 // ============ 下载文件 ============
 
-async function downloadFile(content, fileName) {
+async function downloadFile(content, fileName, robotCode) {
   const token = await getToken();
   const { downloadCode } = content;
   
-  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}`);
+  // 使用回调消息中传入的 robotCode，而不是配置的 agentId
+  const actualRobotCode = robotCode || config.agentId;
+  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}, robotCode: ${actualRobotCode}`);
   
   try {
     // 获取下载链接
     const res = await axios.post(
       'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
-      { downloadCode: downloadCode, robotCode: config.agentId },
+      { downloadCode: downloadCode, robotCode: actualRobotCode },
       { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
     );
     
@@ -167,34 +169,50 @@ async function downloadFile(content, fileName) {
 
 // ============ 发送消息 ============
 
-async function sendText(conversationId, text, conversationType = '1') {
+async function sendText(conversationId, text, conversationType = '1', customRobotId = null) {
   try {
     const token = await getToken();
     const url = conversationType === '2' 
       ? 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend'
       : 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
     
+    // 使用传入的 robotId 或默认的 agentId
+    const botId = customRobotId || config.agentId;
+    console.log('   发送消息 robotId:', botId);
+    
     await axios.post(url, {
-      robotId: config.agentId,
+      robotId: botId,
       openConversationId: conversationId,
       msgtype: 'text',
       text: { content: text }
     }, { headers: { 'x-acs-dingtalk-access-token': token } });
     console.log('   ✅ 已回复');
   } catch (e) {
-    console.log('   ⚠️ 回复失败:', e.message);
+    console.log('   ⚠️ 回复失败:', e.message, e.response?.data);
   }
 }
 
 // ============ 处理消息 ============
 
+// 从 chatbotUserId 提取真正的 robotCode (格式: $:LWCP_v1:$xxxxx)
+function extractRobotCode(chatbotUserId) {
+  if (!chatbotUserId) return null;
+  // 去掉 $:LWCP_v1: 前缀
+  const match = chatbotUserId.match(/^\$:LWCP_v1:\$(.+)$/);
+  return match ? match[1] : chatbotUserId;
+}
+
 async function processMessage(msg, res) {
   console.log(`\n📩 收到消息处理`);
   console.log('   消息:', JSON.stringify(msg).substring(0, 500));
   
-  // 从消息中提取会话信息
+  // 从消息中提取会话信息和机器人标识
   const conversationId = msg.conversationId || msg.openConversationId;
   const conversationType = msg.conversationType || (msg.isGroup ? '2' : '1');
+  
+  // Webhook 回调中使用 chatbotUserId 作为 robotCode
+  const robotCode = extractRobotCode(msg.chatbotUserId);
+  console.log('   提取的robotCode:', robotCode);
   
   if (msg.msgtype === 'file') {
     let content = {};
@@ -209,18 +227,18 @@ async function processMessage(msg, res) {
     console.log('   完整content:', JSON.stringify(content));
     
     if (!isAllowed(fileName)) {
-      await sendText(conversationId, '⚠️ 不支持此格式', conversationType);
+      await sendText(conversationId, '⚠️ 不支持此格式', conversationType, robotCode);
       return;
     }
     
     if (!content.downloadCode) {
       console.log('   ❌ 没有downloadCode');
-      await sendText(conversationId, '❌ 无法获取下载凭证', conversationType);
+      await sendText(conversationId, '❌ 无法获取下载凭证', conversationType, robotCode);
       return;
     }
     
     try {
-      const result = await downloadFile(content, fileName);
+      const result = await downloadFile(content, fileName, robotCode);
       const sizeMB = (result.size / 1024 / 1024).toFixed(2);
       
       console.log(`   ✅ 成功: ${result.name} (${sizeMB}MB)`);
@@ -229,30 +247,30 @@ async function processMessage(msg, res) {
       logs.unshift({ type: 'file', originalName: result.original, fileName: result.name, size: sizeMB, date: result.date, timestamp: new Date().toISOString() });
       saveLog(logs);
       
-      await sendText(conversationId, `✅ 已保存！\n\n文件名: ${result.original}\n大小: ${sizeMB} MB\n日期: ${result.date}`, conversationType);
+      await sendText(conversationId, `✅ 已保存！\n\n文件名: ${result.original}\n大小: ${sizeMB} MB\n日期: ${result.date}`, conversationType, robotCode);
     } catch (e) {
       console.log(`   ❌ 失败: ${e.message}`);
-      await sendText(conversationId, `❌ 下载失败: ${e.message.substring(0, 50)}`, conversationType);
+      await sendText(conversationId, `❌ 下载失败: ${e.message.substring(0, 50)}`, conversationType, robotCode);
     }
   }
   else if (msg.msgtype === 'text') {
     const text = typeof msg.text === 'string' ? msg.text : (msg.text?.content || '').trim();
     console.log(`   文本: ${text}`);
     
-    if (text === '/帮助') await sendText(conversationId, '📖 发送文档自动保存\n支持: PDF,Word,Excel,MD\n\n命令: /状态 /列表', conversationType);
+    if (text === '/帮助') await sendText(conversationId, '📖 发送文档自动保存\n支持: PDF,Word,Excel,MD\n\n命令: /状态 /列表', conversationType, robotCode);
     else if (text === '/状态') {
       const logs = loadLog().filter(l => l.type === 'file');
       const total = logs.reduce((s, l) => s + parseFloat(l.size || 0), 0).toFixed(2);
-      await sendText(conversationId, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${total} MB`, conversationType);
+      await sendText(conversationId, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${total} MB`, conversationType, robotCode);
     }
     else if (text === '/列表') {
       const logs = loadLog().filter(l => l.type === 'file').slice(0, 10);
       let m = '📋 最近:\n\n';
       logs.forEach((l, i) => m += `${i+1}. ${l.originalName}\n${l.size}MB | ${l.date}\n\n`);
-      await sendText(conversationId, m || '暂无', conversationType);
+      await sendText(conversationId, m || '暂无', conversationType, robotCode);
     }
     else {
-      await sendText(conversationId, '收到！发送文件自动保存', conversationType);
+      await sendText(conversationId, '收到！发送文件自动保存', conversationType, robotCode);
     }
   }
   else {
