@@ -1,6 +1,5 @@
 /**
- * 钉钉文档收集机器人 - Stream模式版
- * 使用 dingtalk-stream SDK
+ * 钉钉文档收集机器人 - Stream模式
  */
 
 require('dotenv').config();
@@ -10,7 +9,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DingTalkClient } = require('dingtalk-stream');
+const { EventEmitter } = require('events');
 
 // ============ 配置 ============
 
@@ -196,21 +195,51 @@ async function onMessage(msg) {
 
 // ============ Stream 模式 ============
 
-const client = new DingTalkClient({
-  appKey: config.appKey,
-  appSecret: config.appSecret
-});
+const WebSocket = require('ws');
 
-client.on('message', async (msg) => {
-  await onMessage(msg);
-});
-
-// 启动 Stream 连接
-client.start().then(() => {
-  console.log('🔗 Stream 连接已启动\n');
-}).catch(err => {
-  console.error('❌ Stream 连接失败:', err.message);
-});
+async function startStream() {
+  const token = await getToken();
+  
+  // 获取 websocket 地址
+  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/getWebsocketEndpoint', 
+    { robotCode: config.agentId },
+    { headers: { 'x-acs-dingtalk-access-token': token } }
+  );
+  
+  const endpoint = res.data.endpoint;
+  console.log(`🔗 连接Stream: ${endpoint}`);
+  
+  const ws = new WebSocket(endpoint);
+  
+  ws.on('open', () => {
+    console.log('✅ Stream 连接成功\n');
+  });
+  
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      console.log('收到消息:', msg.topic);
+      
+      if (msg.topic === 'cloudimap.message.receive') {
+        const content = msg.data;
+        if (content && content.msgtype) {
+          await onMessage(content);
+        }
+      }
+    } catch (e) {
+      console.log('解析消息失败:', e.message);
+    }
+  });
+  
+  ws.on('error', (e) => {
+    console.log('❌ Stream错误:', e.message);
+  });
+  
+  ws.on('close', () => {
+    console.log('🔄 Stream断开，5秒后重连...');
+    setTimeout(startStream, 5000);
+  });
+}
 
 // ============ HTTP 服务器 ============
 
@@ -218,6 +247,11 @@ app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'stream' }));
 
 app.listen(config.port, '0.0.0.0', () => {
   console.log(`🤖 文档收集助手 | 端口: ${config.port}\n`);
+});
+
+// 启动 Stream
+startStream().catch(err => {
+  console.error('❌ Stream启动失败:', err.message);
 });
 
 module.exports = app;
