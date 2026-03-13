@@ -152,12 +152,13 @@ async function downloadFile(content, fileName, msgData) {
   // 3. 从 chatbotCorpId 组合
   
   // 先试试提取的 robotCode，如果失败再试 agentId
-  let actualRobotCode = extractedCode || config.agentId;
-  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}, 尝试robotCode: ${actualRobotCode}`);
+  // robotCode 就是 appKey!
+  let actualRobotCode = config.appKey;
+  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}, robotCode: ${actualRobotCode}`);
   
   // 尝试多个 robotCode
   let downloadUrl = null;
-  const codesToTry = [actualRobotCode, config.agentId];
+  const codesToTry = [config.appKey];
   const triedCodes = new Set();
   
   for (const code of codesToTry) {
@@ -222,43 +223,41 @@ async function downloadFile(content, fileName, msgData) {
 // ============ 发送消息 ============
 
 async function sendText(conversationId, text, conversationType = '1', customRobotId = null) {
-  try {
-    const token = await getToken();
+  const token = await getToken();
+  
+  // 尝试多个可能的 API
+  const apisToTry = [
+    { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: customRobotId || config.appKey },
+    { url: 'https://api.dingtalk.com/v1.0/robot/oToMessages/send', robotId: config.agentId },
+    { url: 'https://api.dingtalk.com/v1.0/im/v1/robot/send', robotId: customRobotId || config.appKey },
+  ];
+  
+  for (const api of apisToTry) {
+    if (!api.robotId) continue;
     
-    // 机器人发送消息的 API
-    // 私聊使用 oToMessages, 群聊使用其他 API
-    let url;
-    if (conversationType === '2') {
-      // 群聊
-      url = 'https://api.dingtalk.com/v1.0/robot/groupMessages/send';
-    } else {
-      // 私聊 - 尝试不同的 API
-      url = 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
-    }
-    
-    // 使用传入的 robotId 或默认的 agentId
-    const botId = customRobotId || config.agentId;
-    console.log('   发送消息 robotId:', botId, 'URL:', url);
-    
-    const response = await axios.post(url, {
-      robotId: botId,
-      openConversationId: conversationId,
-      msgtype: 'text',
-      text: { content: text }
-    }, { 
-      headers: { 
-        'x-acs-dingtalk-access-token': token,
-        'Content-Type': 'application/json'
-      } 
-    });
-    console.log('   ✅ 已回复:', response.data);
-  } catch (e) {
-    console.log('   ⚠️ 回复失败:', e.message);
-    if (e.response) {
-      console.log('   状态:', e.response.status);
-      console.log('   数据:', JSON.stringify(e.response.data));
+    try {
+      console.log('   尝试发送消息:', api.url, 'robotId:', api.robotId);
+      
+      const response = await axios.post(api.url, {
+        robotId: api.robotId,
+        openConversationId: conversationId,
+        msgtype: 'text',
+        text: { content: text }
+      }, { 
+        headers: { 
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json'
+        } 
+      });
+      console.log('   ✅ 已回复:', response.data);
+      return;
+    } catch (e) {
+      console.log('   ❌ 失败:', e.response?.status, e.response?.data?.code || e.message);
+      if (e.response?.status === 404) continue; // 尝试下一个
     }
   }
+  
+  console.log('   ⚠️ 所有发送消息API都失败');
 }
 
 // ============ 处理消息 ============
@@ -275,13 +274,13 @@ async function processMessage(msg, res) {
   console.log(`\n📩 收到消息处理`);
   console.log('   消息:', JSON.stringify(msg).substring(0, 500));
   
-  // 从消息中提取会话信息和机器人标识
+  // 从消息中提取会话信息
   const conversationId = msg.conversationId || msg.openConversationId;
   const conversationType = msg.conversationType || (msg.isGroup ? '2' : '1');
   
-  // Webhook 回调中使用 chatbotUserId 作为 robotCode
-  const robotCode = extractRobotCode(msg.chatbotUserId);
-  console.log('   提取的robotCode:', robotCode);
+  // robotCode 就是 appKey
+  const robotCode = config.appKey;
+  console.log('   robotCode:', robotCode);
   
   if (msg.msgtype === 'file') {
     let content = {};
