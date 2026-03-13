@@ -5,23 +5,21 @@
 
 require('dotenv').config();
 
-const { DINGTALK_APP_KEY, DINGTALK_APP_SECRET, DINGTALK_AGENT_ID } = process.env;
-const { DingTalkClient } = require('dingtalk-stream');
-
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { DingTalkClient } = require('dingtalk-stream');
 
 // ============ 配置 ============
 
 const config = {
-  appKey: DINGTALK_APP_KEY || '',
-  appSecret: DINGTALK_APP_SECRET || '',
-  agentId: DINGTALK_AGENT_ID || '',
+  appKey: process.env.DINGTALK_APP_KEY || process.env.BOT_APP_KEY || '',
+  appSecret: process.env.DINGTALK_APP_SECRET || process.env.BOT_APP_SECRET || '',
+  agentId: process.env.DINGTALK_AGENT_ID || process.env.BOT_AGENT_ID || '',
   port: parseInt(process.env.BOT_PORT) || 3565,
-  storageDir: process.env.STORAGE_DIR || './received_documents',
+  storageDir: process.env.STORAGE_DIR || process.env.STORAGE_BASE_DIR || './received_documents',
   allowedExt: ['.pdf', '.doc', '.docx', '.md', '.txt', '.xls', '.xlsx', '.ppt', '.pptx', '.csv', '.zip', '.rar']
 };
 
