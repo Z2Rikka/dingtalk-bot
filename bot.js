@@ -1,5 +1,5 @@
 /**
- * 钉钉文档收集机器人 - Stream模式 (调试版)
+ * 钉钉文档收集机器人 - 支持 Webhook + Stream 双模式
  */
 
 require('dotenv').config();
@@ -17,13 +17,17 @@ const config = {
   appKey: process.env.DINGTALK_APP_KEY || process.env.BOT_APP_KEY || '',
   appSecret: process.env.DINGTALK_APP_SECRET || process.env.BOT_APP_SECRET || '',
   agentId: process.env.DINGTALK_AGENT_ID || process.env.BOT_AGENT_ID || '',
+  // Webhook 模式需要
+  webhookToken: process.env.DINGTALK_WEBHOOK_TOKEN || '',
+  webhookAesKey: process.env.DINGTALK_WEBHOOK_AES_KEY || '',
+  // 服务器配置
   port: parseInt(process.env.BOT_PORT) || 3565,
   storageDir: process.env.STORAGE_DIR || process.env.STORAGE_BASE_DIR || './received_documents',
   allowedExt: ['.pdf', '.doc', '.docx', '.md', '.txt', '.xls', '.xlsx', '.ppt', '.pptx', '.csv', '.zip', '.rar']
 };
 
 if (!config.appKey || !config.appSecret) {
-  console.error('❌ 请配置环境变量');
+  console.error('❌ 请配置环境变量 DINGTALK_APP_KEY 和 DINGTALK_APP_SECRET');
   process.exit(1);
 }
 
@@ -32,7 +36,7 @@ console.log('✅ 配置加载');
 // ============ 初始化 ============
 
 const app = express();
-app.use(express.json({ limit: '10mb' })); // 增加限制
+app.use(express.json({ limit: '10mb' }));
 
 const baseDir = path.resolve(config.storageDir);
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
@@ -77,6 +81,41 @@ function safeName(name) {
   return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
 }
 
+// ============ AES 解密 (Webhook 模式) ============
+
+function decrypt(encrypted, aesKey, token) {
+  try {
+    // AES key 是 base64 编码的
+    const key = Buffer.from(aesKey, 'base64');
+    
+    // 消息体是 JSON 字符串，先 base64 解密，再 AES 解密
+    const encryptedBuf = Buffer.from(encrypted, 'base64');
+    
+    // 使用 AES-256-CBC 解密
+    // 前 16 字节是 IV，后面是实际数据
+    const iv = encryptedBuf.subarray(0, 16);
+    const data = encryptedBuf.subarray(16);
+    
+    // 去除 PKCS7 padding
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(data, null, 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    // 解析 JSON
+    const msg = JSON.parse(decrypted);
+    
+    // 验证 token
+    if (msg.token !== token) {
+      throw new Error('Token 验证失败');
+    }
+    
+    return msg;
+  } catch (e) {
+    console.error('解密错误:', e.message);
+    throw e;
+  }
+}
+
 // ============ 下载文件 ============
 
 async function downloadFile(content, fileName) {
@@ -86,7 +125,7 @@ async function downloadFile(content, fileName) {
   console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}`);
   
   try {
-    // 第一步：获取下载链接
+    // 获取下载链接
     const res = await axios.post(
       'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
       { downloadCode: downloadCode, robotCode: config.agentId },
@@ -100,7 +139,7 @@ async function downloadFile(content, fileName) {
       throw new Error('无法获取下载链接: ' + JSON.stringify(res.data));
     }
     
-    // 第二步：下载文件
+    // 下载文件
     const fileRes = await axios.get(downloadUrl, { responseType: 'stream' });
     
     const dateDir = path.join(baseDir, getToday());
@@ -149,12 +188,13 @@ async function sendText(conversationId, text, conversationType = '1') {
 
 // ============ 处理消息 ============
 
-async function onMessage(msg) {
+async function processMessage(msg, res) {
   console.log(`\n📩 收到消息处理`);
-  console.log('   原始消息:', JSON.stringify(msg).substring(0, 500));
+  console.log('   消息:', JSON.stringify(msg).substring(0, 500));
   
-  const conversationId = msg.conversationId;
-  const conversationType = msg.conversationType;
+  // 从消息中提取会话信息
+  const conversationId = msg.conversationId || msg.openConversationId;
+  const conversationType = msg.conversationType || (msg.isGroup ? '2' : '1');
   
   if (msg.msgtype === 'file') {
     let content = {};
@@ -220,6 +260,47 @@ async function onMessage(msg) {
   }
 }
 
+// ============ Webhook 模式 ============
+
+// Webhook 回调地址
+app.post('/webhook', async (req, res) => {
+  console.log('\n========== 收到 Webhook 回调 ==========');
+  console.log('Query:', req.query);
+  console.log('Body:', JSON.stringify(req.body).substring(0, 500));
+  
+  try {
+    const { signature, msg_signature, timestamp, nonce } = req.query;
+    const { encrypt } = req.body;
+    
+    // 如果有加密内容，需要解密
+    if (encrypt && config.webhookAesKey && config.webhookToken) {
+      try {
+        const decrypted = decrypt(encrypt, config.webhookAesKey, config.webhookToken);
+        console.log('解密后:', JSON.stringify(decrypted).substring(0, 500));
+        
+        // 解密后的消息格式可能不同
+        if (decrypted.eventType === 'im.message' || decrypted.msgtype) {
+          await processMessage(decrypted, res);
+        }
+      } catch (e) {
+        console.error('解密失败:', e.message);
+        // 尝试直接处理（测试阶段可能不加密）
+        if (req.body.msgtype) {
+          await processMessage(req.body, res);
+        }
+      }
+    } else if (req.body.msgtype) {
+      // 未加密的直接消息
+      await processMessage(req.body, res);
+    }
+    
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Webhook 处理错误:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============ Stream 模式 ============
 
 let reconnectTimer = null;
@@ -231,7 +312,7 @@ const client = new DWClient({
 });
 
 const onEventReceived = (event) => {
-  console.log('\n========== 收到事件 ==========');
+  console.log('\n========== 收到 Stream 事件 ==========');
   console.log('headers:', JSON.stringify(event.headers));
   console.log('data类型:', typeof event.data);
   console.log('data:', typeof event.data === 'string' ? event.data : JSON.stringify(event.data).substring(0, 1000));
@@ -256,7 +337,7 @@ const onEventReceived = (event) => {
       console.log('解析后content:', JSON.stringify(content).substring(0, 500));
       
       if (content && content.msgtype) {
-        onMessage(content);
+        processMessage(content);
       } else {
         console.log('没有msgtype，跳过');
       }
@@ -311,14 +392,23 @@ client.on('error', (err) => {
   scheduleReconnect();
 });
 
-connect();
+// 尝试连接 Stream（可选）
+if (config.appKey && config.appSecret) {
+  connect();
+}
 
 // ============ HTTP 服务器 ============
 
-app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'stream' }));
+app.get('/health', (req, res) => res.json({ 
+  status: 'ok', 
+  mode: 'webhook+stream',
+  streamConnected: isConnected 
+}));
 
 app.listen(config.port, '0.0.0.0', () => {
-  console.log(`🤖 文档收集助手 | 端口: ${config.port}\n`);
+  console.log(`\n🤖 文档收集助手 | 端口: ${config.port}`);
+  console.log(`📍 Webhook: http://<your-server>:${config.port}/webhook`);
+  console.log(`📍 Health:  http://<your-server>:${config.port}/health\n`);
 });
 
 module.exports = app;
