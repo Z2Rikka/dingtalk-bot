@@ -1,6 +1,6 @@
 /**
- * 钉钉文档收集机器人 v4
- * 修复文件下载问题
+ * 钉钉文档收集机器人 v5
+ * 使用正确的API下载文件
  */
 
 require('dotenv').config();
@@ -9,6 +9,7 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const crypto = require('crypto');
 
 // ============ 配置 ============
@@ -88,95 +89,118 @@ function sanitizeFileName(fileName) {
   return fileName.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
 }
 
-// ============ 下载文件 - 尝试多种方式 ============
+// 解压gzip响应
+async function parseResponse(response) {
+  const contentType = response.headers['content-type'] || '';
+  
+  // 检查是否是JSON错误响应
+  if (contentType.includes('application/json')) {
+    const chunks = [];
+    for await (const chunk of response.data) {
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks);
+    
+    // 尝试解压gzip
+    try {
+      const decompressed = zlib.gunzipSync(buffer);
+      return JSON.parse(decompressed.toString());
+    } catch {
+      return JSON.parse(buffer.toString());
+    }
+  }
+  
+  // 返回流用于下载
+  return response.data;
+}
+
+// ============ 下载文件 ============
 
 async function downloadFile(content, fileName, accessToken) {
   const downloadCode = content.downloadCode;
-  const spaceId = content.spaceId;
-  const fileId = content.fileId;
+  const mediaId = content.mediaId; // 可能存在mediaId
   
-  console.log(`📥 尝试下载: ${fileName}`);
-  console.log(`   downloadCode: ${downloadCode ? '有' : '无'}`);
-  console.log(`   spaceId: ${spaceId ? '有' : '无'}`);
-  console.log(`   fileId: ${fileId ? '有' : '无'}`);
+  console.log(`📥 下载: ${fileName}`);
   
-  // 方法1: 使用 tmpCode 下载
-  if (downloadCode) {
+  // 尝试多种方式
+  
+  // 方法1: 使用媒体文件API (需要mediaId)
+  if (mediaId) {
     try {
-      console.log('   尝试方法1: tmpCode下载...');
-      const res = await axios.post(
-        'https://api.dingtalk.com/v1.0/robot/message/files/downloadByTmpCode',
-        { tmpCode: downloadCode },
-        { 
-          headers: { 
-            'x-acs-dingtalk-access-token': accessToken,
-            'Content-Type': 'application/json'
-          },
-          responseType: 'stream'
-        }
-      );
+      console.log('   方式1: 使用mediaId...');
+      const url = `https://api.dingtalk.com/v1.0/robot/media/download?robotId=${botConfig.agentId}&mediaId=${mediaId}`;
+      const res = await axios.get(url, {
+        headers: { 'x-acs-dingtalk-access-token': accessToken },
+        responseType: 'stream'
+      });
       
-      // 检查是否返回错误
-      const contentType = res.headers['content-type'] || '';
-      if (contentType.includes('application/json')) {
-        const chunks = [];
-        for await (const chunk of res.data) chunks.push(chunk);
-        const errorBody = Buffer.concat(chunks).toString();
-        console.log('   方法1失败:', errorBody);
+      // 检查返回类型
+      const ct = res.headers['content-type'] || '';
+      if (ct.includes('application/json')) {
+        console.log('   方式1返回JSON，尝试解压...');
       } else {
         return await saveFile(res.data, fileName);
       }
     } catch (e) {
-      console.log('   方法1错误:', e.response?.data || e.message);
+      console.log('   方式1失败:', e.response?.data || e.message);
     }
   }
   
-  // 方法2: 通过 spaceId 获取下载链接
-  if (spaceId && fileId) {
-    try {
-      console.log('   尝试方法2: 获取下载链接...');
-      const res = await axios.post(
-        'https://api.dingtalk.com/v1.0/robot/file/getUploadUrl',
-        {
-          spaceId: spaceId,
-          fileId: fileId,
-          fileName: fileName
-        },
-        { headers: { 'x-acs-dingtalk-access-token': accessToken } }
-      );
-      
-      if (res.data.downloadUrl) {
-        console.log('   获取到下载链接，下载中...');
-        const fileRes = await axios.get(res.data.downloadUrl, { responseType: 'stream' });
-        return await saveFile(fileRes.data, fileName);
-      }
-    } catch (e) {
-      console.log('   方法2错误:', e.response?.data || e.message);
-    }
-  }
-  
-  // 方法3: 使用旧版API (webhook)
+  // 方法2: 通过临时code
   if (downloadCode) {
     try {
-      console.log('   尝试方法3: 通过OAuth token...');
+      console.log('   方式2: 使用downloadCode...');
       const res = await axios.post(
-        'https://api.dingtalk.com/v1.0/robot/message/files/downloadByTmpCode',
+        'https://api.dingtalk.com/v1.0/robot/message/files/download',
         { tmpCode: downloadCode },
-        { 
-          headers: { 
+        {
+          headers: {
             'x-acs-dingtalk-access-token': accessToken,
             'Content-Type': 'application/json'
           },
           responseType: 'stream'
         }
       );
-      return await saveFile(res.data, fileName);
+      
+      const ct = res.headers['content-type'] || '';
+      if (ct.includes('application/json')) {
+        const error = await parseResponse(res);
+        console.log('   方式2失败:', error);
+      } else {
+        return await saveFile(res.data, fileName);
+      }
     } catch (e) {
-      console.log('   方法3错误:', e.response?.data || e.message);
+      console.log('   方式2失败:', e.response?.data || e.message);
     }
   }
   
-  throw new Error('无法下载：所有方法都失败');
+  // 方法3: 尝试新版API
+  try {
+    console.log('   方式3: 新版API...');
+    const res = await axios.post(
+      'https://api.dingtalk.com/v1.0/robot/file/download',
+      { fileId: content.fileId },
+      {
+        headers: {
+          'x-acs-dingtalk-access-token': accessToken,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'stream'
+      }
+    );
+    
+    const ct = res.headers['content-type'] || '';
+    if (ct.includes('application/json')) {
+      const error = await parseResponse(res);
+      console.log('   方式3失败:', error);
+    } else {
+      return await saveFile(res.data, fileName);
+    }
+  } catch (e) {
+    console.log('   方式3失败:', e.response?.data || e.message);
+  }
+  
+  throw new Error('所有下载方式都失败');
 }
 
 async function saveFile(stream, originalName) {
@@ -209,11 +233,10 @@ async function saveFile(stream, originalName) {
   });
 }
 
-// ============ 发送消息 ============
+// ============ 发送回复 ============
 
 async function sendReply(message, content) {
   try {
-    // 优先用 sessionWebhook
     if (message.sessionWebhook) {
       await axios.post(message.sessionWebhook, {
         msgtype: 'text',
@@ -222,10 +245,9 @@ async function sendReply(message, content) {
       return;
     }
     
-    // 用 openConversationId
     if (message.conversationId) {
       const token = await getAccessToken();
-      const url = message.conversationType === '2' 
+      const url = message.conversationType === '2'
         ? 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend'
         : 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
       
@@ -246,11 +268,14 @@ async function sendReply(message, content) {
 async function handleMessage(message) {
   console.log(`\n📩 ${message.msgtype} | ${message.conversationType === '2' ? '群聊' : '私聊'}`);
   
-  const accessToken = await getAccessToken();
+  const token = await getAccessToken();
   
   if (message.msgtype === 'file') {
     const content = message.content || {};
     const fileName = content.fileName || message.fileName || '未知文件';
+    
+    console.log(`   文件: ${fileName}`);
+    console.log(`   content keys: ${Object.keys(content).join(', ')}`);
     
     if (!isAllowedExtension(fileName)) {
       await sendReply(message, `⚠️ 不支持此格式`);
@@ -258,7 +283,7 @@ async function handleMessage(message) {
     }
     
     try {
-      const result = await downloadFile(content, fileName, accessToken);
+      const result = await downloadFile(content, fileName, token);
       const sizeMB = (result.size / 1024 / 1024).toFixed(2);
       
       console.log(`✅ 成功: ${result.name} (${sizeMB}MB)`);
@@ -281,34 +306,26 @@ async function handleMessage(message) {
   else if (message.msgtype === 'text') {
     const text = typeof message.text === 'string' ? message.text : (message.text?.content || '');
     
-    if (text === '/帮助' || text === '/help') {
-      await sendReply(message, '📖 发送文档自动保存\n支持: PDF,Word,Excel,PPT,TXT\n\n命令: /状态 /列表 /目录 /帮助');
+    if (text === '/帮助') {
+      await sendReply(message, '📖 发送文档自动保存\n支持: PDF,Word,Excel,PPT\n\n命令: /状态 /列表 /目录');
     }
-    else if (text === '/状态' || text === '/stats') {
+    else if (text === '/状态') {
       const logs = loadLog().filter(l => l.type === 'file');
       const totalSize = logs.reduce((s, l) => s + parseFloat(l.size || 0), 0).toFixed(2);
       await sendReply(message, `📊 统计\n\n文档: ${logs.length} 个\n大小: ${totalSize} MB`);
     }
-    else if (text === '/列表' || text === '/list') {
+    else if (text === '/列表') {
       const logs = loadLog().filter(l => l.type === 'file').slice(0, 10);
       let msg = '📋 最近:\n\n';
       logs.forEach((l, i) => msg += `${i+1}. ${l.originalName}\n${l.size}MB | ${l.dateDir}\n\n`);
       await sendReply(message, msg || '暂无');
-    }
-    else if (text === '/目录' || text === '/dir') {
-      try {
-        const dirs = fs.readdirSync(baseDir).filter(d => /^\d{8}$/.test(d)).sort().reverse();
-        await sendReply(message, `📁 ${baseDir}\n\n${dirs.slice(0,10).map(d => '• ' + d).join('\n')}`);
-      } catch {}
     }
   }
 }
 
 // ============ Webhook ============
 
-app.get('/webhook', (req, res) => {
-  res.send(req.query.echostr);
-});
+app.get('/webhook', (req, res) => res.send(req.query.echostr));
 
 app.post('/webhook', async (req, res) => {
   res.send('success');
