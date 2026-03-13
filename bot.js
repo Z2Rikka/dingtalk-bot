@@ -229,25 +229,36 @@ async function downloadFile(fileId, fileName, accessToken) {
 /**
  * 发送消息到群/私聊
  */
-async function sendMessage(targetId, targetType, content) {
+async function sendMessage(targetId, targetType, content, sessionWebhook) {
   if (!config.message.autoReply) return;
   
   try {
     const accessToken = await getAccessToken();
     let url;
+    let requestBody;
     
-    if (targetType === 'group') {
+    if (sessionWebhook) {
+      url = sessionWebhook.trim();
+      requestBody = { msgtype: 'text', text: { content } };
+    } else if (targetType === 'group') {
       url = `https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend`;
+      requestBody = {
+        robotId: config.bot.agentId,
+        openConversationId: targetId,
+        msgtype: 'text',
+        text: { content }
+      };
     } else {
       url = `https://api.dingtalk.com/v1.0/robot/oToMessages/send`;
+      requestBody = {
+        robotId: config.bot.agentId,
+        openConversationId: targetId,
+        msgtype: 'text',
+        text: { content }
+      };
     }
     
-    await axios.post(url, {
-      robotId: config.bot.agentId,
-      openConversationId: targetId,
-      msgtype: 'text',
-      text: { content }
-    }, {
+    await axios.post(url, requestBody, {
       headers: { 'x-acs-dingtalk-access-token': accessToken }
     });
   } catch (error) {
@@ -273,15 +284,16 @@ function getAllowedFormatsList() {
 /**
  * 处理文件消息
  */
-async function handleFileMessage(message, accessToken) {
-  if (!message.file) {
+async function handleFileMessage(message, accessToken, chatType, sessionWebhook) {
+  const content = message.content || {};
+  const fileId = content.fileId || content.fileID;
+  const fileName = content.fileName || 'unknown_file';
+  
+  if (!fileId) {
     console.log('\n⚠️ 消息包含 file 类型但无文件信息');
     console.log('完整消息:', JSON.stringify(message, null, 2));
     return;
   }
-  
-  const fileId = message.file.fileId;
-  const fileName = message.file.fileName || 'unknown_file';
   
   console.log('\n========== 收到文件 ==========');
   console.log('文件名:', fileName);
@@ -299,7 +311,7 @@ async function handleFileMessage(message, accessToken) {
     
     console.log(`❌ 不支持的格式: ${getExtension(fileName)}`);
     
-    await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', reply);
+    await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
     
     // 记录日志
     addLog({
@@ -351,7 +363,7 @@ async function handleFileMessage(message, accessToken) {
     .replace('{date}', result.dateDir)
     .replace('{filepath}', result.path);
   
-  await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', reply);
+  await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
   
   return result;
 }
@@ -360,16 +372,20 @@ async function handleFileMessage(message, accessToken) {
  * 消息处理入口
  */
 async function handleMessage(message) {
+  const sessionWebhook = message.sessionWebhook;
+  const conversationType = message.conversationType;
+  const chatType = conversationType === '1' ? 'group' : 'private';
+  
   console.log(`\n📩 收到消息:`);
   console.log(`   类型: ${message.msgtype}`);
-  console.log(`   会话: ${message.chatType}`);
+  console.log(`   会话: ${chatType}`);
   console.log(`   发送者: ${message.senderNick || message.senderId}`);
   
   const accessToken = await getAccessToken();
   
   // 只处理文件消息
   if (message.msgtype === 'file') {
-    return await handleFileMessage(message, accessToken);
+    return await handleFileMessage(message, accessToken, chatType, sessionWebhook);
   }
   else if (message.msgtype === 'text') {
     // 处理文本命令
@@ -387,7 +403,7 @@ async function handleMessage(message) {
         `• /目录 - 存储目录\n` +
         `• /帮助 - 显示帮助`;
       
-      await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', helpMsg);
+      await sendMessage(message.conversationId, chatType, helpMsg, sessionWebhook);
     }
     // 状态命令
     else if (text === '/状态' || text === '/stats') {
@@ -400,7 +416,7 @@ async function handleMessage(message) {
         `💾 总大小: ${totalSize.toFixed(2)} MB\n` +
         `📁 存储目录: ${baseDir}`;
       
-      await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', statsMsg);
+      await sendMessage(message.conversationId, chatType, statsMsg, sessionWebhook);
     }
     // 列表命令
     else if (text === '/列表' || text === '/list') {
@@ -416,7 +432,7 @@ async function handleMessage(message) {
         listMsg = '暂无记录';
       }
       
-      await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', listMsg);
+      await sendMessage(message.conversationId, chatType, listMsg, sessionWebhook);
     }
     // 目录命令
     else if (text === '/目录' || text === '/dir') {
@@ -427,9 +443,9 @@ async function handleMessage(message) {
           `日期目录:\n` +
           dirs.slice(0, 10).map(d => `• ${d}`).join('\n');
         
-        await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', dirMsg);
+        await sendMessage(message.conversationId, chatType, dirMsg, sessionWebhook);
       } catch (e) {
-        await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', `目录错误: ${e.message}`);
+        await sendMessage(message.conversationId, chatType, `目录错误: ${e.message}`, sessionWebhook);
       }
     }
   }
@@ -476,7 +492,7 @@ app.post('/webhook', async (req, res) => {
     
     if (message.conversationId) {
       const reply = config.message.replyTemplates.error.replace('{error}', error.message);
-      await sendMessage(message.conversationId, message.chatType === 'group' ? 'group' : 'private', reply);
+      await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
     }
   }
   
