@@ -53,7 +53,7 @@ function decodeAESKey(encodedKey) {
   return keyBuffer.slice(0, 32);
 }
 
-function signature(token, timestamp, nonce, encrypt) {
+function checkSignature(token, timestamp, nonce, encrypt) {
   const sortArr = [token, timestamp, nonce, encrypt].sort();
   const signStr = sortArr.join('');
   return crypto.createHash('sha1').update(signStr).digest('hex');
@@ -285,7 +285,7 @@ app.get('/webhook', (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query;
   
   // 验证签名
-  const mySignature = signature(botConfig.token, timestamp, nonce, echostr);
+  const mySignature = checkSignature(botConfig.token, timestamp, nonce, echostr);
   
   if (mySignature !== signature) {
     console.log('❌ 签名验证失败');
@@ -309,7 +309,7 @@ app.post('/webhook', async (req, res) => {
     console.log('📨 收到加密消息');
     
     // 验证签名
-    const mySignature = signature(botConfig.token, timestamp, nonce, encrypt);
+    const mySignature = checkSignature(botConfig.token, timestamp, nonce, encrypt);
     
     if (mySignature !== signature) {
       console.log('❌ 签名验证失败');
