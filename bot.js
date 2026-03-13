@@ -1,5 +1,5 @@
 /**
- * 钉钉文档收集机器人 - Stream模式 (官方SDK版)
+ * 钉钉文档收集机器人 - Stream模式 (调试版)
  */
 
 require('dotenv').config();
@@ -32,7 +32,7 @@ console.log('✅ 配置加载');
 // ============ 初始化 ============
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // 增加限制
 
 const baseDir = path.resolve(config.storageDir);
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
@@ -83,34 +83,47 @@ async function downloadFile(content, fileName) {
   const token = await getToken();
   const { downloadCode } = content;
   
-  console.log(`📥 下载: ${fileName}`);
+  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}`);
   
-  const res = await axios.post(
-    'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
-    { downloadCode: downloadCode, robotCode: config.agentId },
-    { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
-  );
-  
-  const { downloadUrl } = res.data;
-  if (!downloadUrl) {
-    throw new Error('无法获取下载链接');
+  try {
+    // 第一步：获取下载链接
+    const res = await axios.post(
+      'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
+      { downloadCode: downloadCode, robotCode: config.agentId },
+      { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
+    );
+    
+    console.log('   API响应:', JSON.stringify(res.data));
+    
+    const { downloadUrl } = res.data;
+    if (!downloadUrl) {
+      throw new Error('无法获取下载链接: ' + JSON.stringify(res.data));
+    }
+    
+    // 第二步：下载文件
+    const fileRes = await axios.get(downloadUrl, { responseType: 'stream' });
+    
+    const dateDir = path.join(baseDir, getToday());
+    if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
+    
+    const ext = path.extname(fileName);
+    const finalName = `${Date.now()}_${crypto.randomBytes(4).toHexString()}_${safeName(path.basename(fileName, ext))}${ext}`;
+    const filePath = path.join(dateDir, finalName);
+    
+    return new Promise((resolve, reject) => {
+      fileRes.data.pipe(fs.createWriteStream(filePath)).on('finish', () => {
+        const stats = fs.statSync(filePath);
+        resolve({ name: finalName, original: fileName, size: stats.size, date: getToday() });
+      }).on('error', reject);
+    });
+  } catch (e) {
+    console.error('   下载错误:', e.message);
+    if (e.response) {
+      console.error('   响应状态:', e.response.status);
+      console.error('   响应数据:', e.response.data);
+    }
+    throw e;
   }
-  
-  const fileRes = await axios.get(downloadUrl, { responseType: 'stream' });
-  
-  const dateDir = path.join(baseDir, getToday());
-  if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
-  
-  const ext = path.extname(fileName);
-  const finalName = `${Date.now()}_${crypto.randomBytes(4).toHexString()}_${safeName(path.basename(fileName, ext))}${ext}`;
-  const filePath = path.join(dateDir, finalName);
-  
-  return new Promise((resolve, reject) => {
-    fileRes.data.pipe(fs.createWriteStream(filePath)).on('finish', () => {
-      const stats = fs.statSync(filePath);
-      resolve({ name: finalName, original: fileName, size: stats.size, date: getToday() });
-    }).on('error', reject);
-  });
 }
 
 // ============ 发送消息 ============
@@ -137,7 +150,8 @@ async function sendText(conversationId, text, conversationType = '1') {
 // ============ 处理消息 ============
 
 async function onMessage(msg) {
-  console.log(`\n📩 ${msg.msgtype} | ${msg.conversationType === '2' ? '群聊' : '私聊'}`);
+  console.log(`\n📩 收到消息处理`);
+  console.log('   原始消息:', JSON.stringify(msg).substring(0, 500));
   
   const conversationId = msg.conversationId;
   const conversationType = msg.conversationType;
@@ -147,11 +161,12 @@ async function onMessage(msg) {
     let fileName = '未知文件';
     
     if (msg.content) {
-      try { content = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch {}
+      try { content = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch { console.log('   内容解析失败'); }
     }
     
     fileName = content.fileName || msg.fileName || '未知文件';
     console.log(`   文件: ${fileName}`);
+    console.log('   完整content:', JSON.stringify(content));
     
     if (!isAllowed(fileName)) {
       await sendText(conversationId, '⚠️ 不支持此格式', conversationType);
@@ -159,6 +174,7 @@ async function onMessage(msg) {
     }
     
     if (!content.downloadCode) {
+      console.log('   ❌ 没有downloadCode');
       await sendText(conversationId, '❌ 无法获取下载凭证', conversationType);
       return;
     }
@@ -195,6 +211,12 @@ async function onMessage(msg) {
       logs.forEach((l, i) => m += `${i+1}. ${l.originalName}\n${l.size}MB | ${l.date}\n\n`);
       await sendText(conversationId, m || '暂无', conversationType);
     }
+    else {
+      await sendText(conversationId, '收到！发送文件自动保存', conversationType);
+    }
+  }
+  else {
+    console.log('   未处理的消息类型:', msg.msgtype);
   }
 }
 
@@ -209,14 +231,17 @@ const client = new DWClient({
 });
 
 const onEventReceived = (event) => {
-  console.log('📨 收到事件完整:', JSON.stringify(event).substring(0, 300));
-  console.log('   Headers:', JSON.stringify(event.headers));
+  console.log('\n========== 收到事件 ==========');
+  console.log('headers:', JSON.stringify(event.headers));
+  console.log('data类型:', typeof event.data);
+  console.log('data:', typeof event.data === 'string' ? event.data : JSON.stringify(event.data).substring(0, 1000));
   
   try {
-    if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
+    const topic = event.headers?.topic || event.headers?.eventType;
+    console.log('topic:', topic);
+    
+    if (topic === 'im.message.receive' || topic === 'im.messageReceive') {
       let content;
-      
-      console.log('   Data:', event.data);
       
       if (typeof event.data === 'string') {
         try {
@@ -228,28 +253,25 @@ const onEventReceived = (event) => {
         content = event.data;
       }
       
-      console.log('   解析后:', JSON.stringify(content).substring(0, 200));
-      console.log('   消息类型:', content?.msgtype);
-      console.log('   conversationId:', content?.conversationId);
-      console.log('   conversationType:', content?.conversationType);
+      console.log('解析后content:', JSON.stringify(content).substring(0, 500));
       
       if (content && content.msgtype) {
         onMessage(content);
       } else {
-        console.log('   ⚠️ 消息格式不对，跳过');
+        console.log('没有msgtype，跳过');
       }
     } else {
-      console.log('   ⚠️ 非消息事件:', event.headers?.topic);
+      console.log('不处理此topic');
     }
   } catch (e) {
     console.log('   解析错误:', e.message);
+    console.log(e.stack);
   }
   
   return { status: EventAck.SUCCESS, message: 'OK' };
 };
 
 function connect() {
-  console.log('🔄 正在连接 Stream...');
   client
     .registerAllEventListener(onEventReceived)
     .connect()
