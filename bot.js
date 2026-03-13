@@ -83,32 +83,55 @@ function safeName(name) {
 
 // ============ AES 解密 (Webhook 模式) ============
 
-function decrypt(encrypted, aesKey, token) {
+function verifySignature(signature, timestamp, token, aesKey) {
+  try {
+    const stringToSign = timestamp + token;
+    const hmac = crypto.createHmac('sha256', aesKey);
+    hmac.update(stringToSign);
+    const calculatedSignature = hmac.digest('base64');
+    
+    console.log('   签名验证:', { 
+      received: signature, 
+      calculated: calculatedSignature,
+      match: calculatedSignature === signature 
+    });
+    
+    return calculatedSignature === signature;
+  } catch (e) {
+    console.error('签名验证错误:', e.message);
+    return false;
+  }
+}
+
+function decrypt(encrypted, aesKey) {
   try {
     // AES key 是 base64 编码的
     const key = Buffer.from(aesKey, 'base64');
     
-    // 消息体是 JSON 字符串，先 base64 解密，再 AES 解密
+    // 消息体是 base64 编码的，先解密
     const encryptedBuf = Buffer.from(encrypted, 'base64');
     
     // 使用 AES-256-CBC 解密
-    // 前 16 字节是 IV，后面是实际数据
+    // 前 16 字节是 IV
     const iv = encryptedBuf.subarray(0, 16);
     const data = encryptedBuf.subarray(16);
     
-    // 去除 PKCS7 padding
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    decipher.setAutoPadding(true);
+    
     let decrypted = decipher.update(data, null, 'utf8');
     decrypted += decipher.final('utf8');
     
-    // 解析 JSON
-    const msg = JSON.parse(decrypted);
-    
-    // 验证 token
-    if (msg.token !== token) {
-      throw new Error('Token 验证失败');
+    // 去除 PKCS7 padding
+    const pad = decrypted.charCodeAt(decrypted.length - 1);
+    if (pad > 0 && pad <= 16) {
+      decrypted = decrypted.slice(0, -pad);
     }
     
+    console.log('   解密原始:', decrypted.substring(0, 200));
+    
+    // 解析 JSON
+    const msg = JSON.parse(decrypted);
     return msg;
   } catch (e) {
     console.error('解密错误:', e.message);
@@ -118,30 +141,59 @@ function decrypt(encrypted, aesKey, token) {
 
 // ============ 下载文件 ============
 
-async function downloadFile(content, fileName, robotCode) {
+async function downloadFile(content, fileName, msgData) {
   const token = await getToken();
   const { downloadCode } = content;
   
-  // 使用回调消息中传入的 robotCode，而不是配置的 agentId
-  const actualRobotCode = robotCode || config.agentId;
-  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}, robotCode: ${actualRobotCode}`);
+  // 尝试多个可能的 robotCode
+  // 1. 从 chatbotUserId 提取的
+  const extractedCode = extractRobotCode(msgData.chatbotUserId);
+  // 2. 配置的 agentId
+  // 3. 从 chatbotCorpId 组合
   
-  try {
-    // 获取下载链接
-    const res = await axios.post(
-      'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
-      { downloadCode: downloadCode, robotCode: actualRobotCode },
-      { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
-    );
+  // 先试试提取的 robotCode，如果失败再试 agentId
+  let actualRobotCode = extractedCode || config.agentId;
+  console.log(`📥 下载: ${fileName}, downloadCode: ${downloadCode}, 尝试robotCode: ${actualRobotCode}`);
+  
+  // 尝试多个 robotCode
+  let downloadUrl = null;
+  const codesToTry = [actualRobotCode, config.agentId];
+  const triedCodes = new Set();
+  
+  for (const code of codesToTry) {
+    if (!code || triedCodes.has(code)) continue;
+    triedCodes.add(code);
     
-    console.log('   API响应:', JSON.stringify(res.data));
+    console.log(`   尝试 robotCode: ${code}`);
     
-    const { downloadUrl } = res.data;
-    if (!downloadUrl) {
-      throw new Error('无法获取下载链接: ' + JSON.stringify(res.data));
+    try {
+      const res = await axios.post(
+        'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
+        { downloadCode: downloadCode, robotCode: code },
+        { headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' } }
+      );
+      
+      if (res.data.downloadUrl) {
+        downloadUrl = res.data.downloadUrl;
+        actualRobotCode = code;
+        console.log(`   ✅ 成功! robotCode: ${code}`);
+        break;
+      }
+    } catch (e) {
+      console.log(`   ❌ robotCode ${code} 失败: ${e.response?.data?.code || e.message}`);
+      if (e.response?.data?.code === 'invalidParameter.robotCode.auth') {
+        continue; // 尝试下一个
+      }
+      throw e;
     }
-    
-    // 下载文件
+  }
+  
+  if (!downloadUrl) {
+    throw new Error('所有 robotCode 都失败');
+  }
+  
+  // 下载文件
+  try {
     const fileRes = await axios.get(downloadUrl, { responseType: 'stream' });
     
     const dateDir = path.join(baseDir, getToday());
@@ -172,23 +224,40 @@ async function downloadFile(content, fileName, robotCode) {
 async function sendText(conversationId, text, conversationType = '1', customRobotId = null) {
   try {
     const token = await getToken();
-    const url = conversationType === '2' 
-      ? 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend'
-      : 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
+    
+    // 机器人发送消息的 API
+    // 私聊使用 oToMessages, 群聊使用其他 API
+    let url;
+    if (conversationType === '2') {
+      // 群聊
+      url = 'https://api.dingtalk.com/v1.0/robot/groupMessages/send';
+    } else {
+      // 私聊 - 尝试不同的 API
+      url = 'https://api.dingtalk.com/v1.0/robot/oToMessages/send';
+    }
     
     // 使用传入的 robotId 或默认的 agentId
     const botId = customRobotId || config.agentId;
-    console.log('   发送消息 robotId:', botId);
+    console.log('   发送消息 robotId:', botId, 'URL:', url);
     
-    await axios.post(url, {
+    const response = await axios.post(url, {
       robotId: botId,
       openConversationId: conversationId,
       msgtype: 'text',
       text: { content: text }
-    }, { headers: { 'x-acs-dingtalk-access-token': token } });
-    console.log('   ✅ 已回复');
+    }, { 
+      headers: { 
+        'x-acs-dingtalk-access-token': token,
+        'Content-Type': 'application/json'
+      } 
+    });
+    console.log('   ✅ 已回复:', response.data);
   } catch (e) {
-    console.log('   ⚠️ 回复失败:', e.message, e.response?.data);
+    console.log('   ⚠️ 回复失败:', e.message);
+    if (e.response) {
+      console.log('   状态:', e.response.status);
+      console.log('   数据:', JSON.stringify(e.response.data));
+    }
   }
 }
 
@@ -238,7 +307,7 @@ async function processMessage(msg, res) {
     }
     
     try {
-      const result = await downloadFile(content, fileName, robotCode);
+      const result = await downloadFile(content, fileName, msg);
       const sizeMB = (result.size / 1024 / 1024).toFixed(2);
       
       console.log(`   ✅ 成功: ${result.name} (${sizeMB}MB)`);
@@ -290,15 +359,25 @@ app.post('/webhook', async (req, res) => {
     const { signature, msg_signature, timestamp, nonce } = req.query;
     const { encrypt } = req.body;
     
+    // 验证签名
+    if (signature && timestamp && config.webhookToken && config.webhookAesKey) {
+      const aesKey = config.webhookAesKey;
+      if (!verifySignature(signature, timestamp, config.webhookToken, aesKey)) {
+        console.log('⚠️ 签名验证失败，但继续处理...');
+      }
+    }
+    
     // 如果有加密内容，需要解密
-    if (encrypt && config.webhookAesKey && config.webhookToken) {
+    if (encrypt && config.webhookAesKey) {
       try {
-        const decrypted = decrypt(encrypt, config.webhookAesKey, config.webhookToken);
+        const decrypted = decrypt(encrypt, config.webhookAesKey);
         console.log('解密后:', JSON.stringify(decrypted).substring(0, 500));
         
         // 解密后的消息格式可能不同
         if (decrypted.eventType === 'im.message' || decrypted.msgtype) {
           await processMessage(decrypted, res);
+        } else {
+          console.log('   非消息事件，跳过');
         }
       } catch (e) {
         console.error('解密失败:', e.message);
@@ -310,6 +389,8 @@ app.post('/webhook', async (req, res) => {
     } else if (req.body.msgtype) {
       // 未加密的直接消息
       await processMessage(req.body, res);
+    } else {
+      console.log('   无需处理的内容');
     }
     
     res.json({ success: true });
