@@ -1,6 +1,5 @@
 /**
- * 钉钉文档收集机器人 - 最终版
- * 使用正确的钉钉API格式
+ * 钉钉文档收集机器人 - 支持HTTP回调签名验证
  */
 
 require('dotenv').config();
@@ -18,6 +17,9 @@ const botConfig = {
   appKey: process.env.BOT_APP_KEY || '',
   appSecret: process.env.BOT_APP_SECRET || '',
   agentId: process.env.BOT_AGENT_ID || '',
+  // 钉钉事件订阅的密钥
+  token: process.env.DINGTALK_TOKEN || '53oMEiOSL3WNmNniyGwVz3ogjXyTL',
+  aesKey: process.env.DINGTALK_AES_KEY || 'odOv37WkKoIMLtpOKH8cRbxrrzpyMhQx9A0t6H8k2cX',
   name: process.env.BOT_NAME || '文档收集助手',
   port: parseInt(process.env.BOT_PORT) || 3000
 };
@@ -39,9 +41,39 @@ console.log('✅ 配置加载');
 const TIMEZONE_OFFSET = 8 * 60 * 60 * 1000;
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const baseDir = path.resolve(storageConfig.baseDir);
 if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
+
+// ============ 钉钉签名验证和解密 ============
+
+function decodeAESKey(encodedKey) {
+  const keyBuffer = Buffer.from(encodedKey + '=', 'base64');
+  return keyBuffer.slice(0, 32);
+}
+
+function signature(token, timestamp, nonce, encrypt) {
+  const sortArr = [token, timestamp, nonce, encrypt].sort();
+  const signStr = sortArr.join('');
+  return crypto.createHash('sha1').update(signStr).digest('hex');
+}
+
+function decrypt(encrypt, aesKey) {
+  try {
+    const key = decodeAESKey(aesKey);
+    const cipher = crypto.createDecipheriv('aes-256-cbc', key, key);
+    let decrypted = cipher.update(encrypt, 'base64', 'utf8');
+    decrypted += cipher.final('utf8');
+    
+    // 去除 PKCS7 填充
+    const pad = decrypted.charCodeAt(decrypted.length - 1);
+    return decrypted.slice(0, decrypted.length - pad);
+  } catch (e) {
+    console.error('解密失败:', e.message);
+    return null;
+  }
+}
 
 // ============ 工具函数 ============
 
@@ -58,9 +90,7 @@ let tokenExpireTime = 0;
 
 async function getAccessToken() {
   const now = Date.now();
-  if (cachedToken && now < tokenExpireTime) {
-    return cachedToken;
-  }
+  if (cachedToken && now < tokenExpireTime) return cachedToken;
   
   const res = await axios.post('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
     appKey: botConfig.appKey,
@@ -69,8 +99,7 @@ async function getAccessToken() {
   
   cachedToken = res.data.accessToken;
   tokenExpireTime = now + (res.data.expireIn - 300) * 1000;
-  
-  console.log('🔑 获取新Token');
+  console.log('🔑 获取Token');
   return cachedToken;
 }
 
@@ -113,29 +142,15 @@ async function downloadWithTmpCode(tmpCode, fileName, token) {
     }
   );
   
-  // 检查content-type
   const contentType = response.headers['content-type'] || '';
   console.log('   Content-Type:', contentType);
   
   if (contentType.includes('application/json')) {
-    // 是JSON，读取错误信息
     let data = '';
-    for await (const chunk of response.data) {
-      data += chunk.toString();
-    }
-    // 尝试解压
-    try {
-      const buf = Buffer.from(data, 'base64');
-      const decompressed = zlib.gunzipSync(buf);
-      const error = JSON.parse(decompressed.toString());
-      throw new Error(error.message || JSON.stringify(error));
-    } catch (e) {
-      try { JSON.parse(data); } catch { throw new Error(data.substring(0, 200)); }
-      throw new Error(data.substring(0, 200));
-    }
+    for await (const chunk of response.data) { data += chunk.toString(); }
+    throw new Error(data.substring(0, 100));
   }
   
-  // 是文件流，保存
   return response.data;
 }
 
@@ -147,7 +162,6 @@ async function downloadFile(content, fileName) {
   
   const stream = await downloadWithTmpCode(tmpCode, fileName, token);
   
-  // 保存文件
   const dateDir = path.join(baseDir, formatDate(getCurrentDate()));
   if (!fs.existsSync(dateDir)) fs.mkdirSync(dateDir, { recursive: true });
   
@@ -161,13 +175,7 @@ async function downloadFile(content, fileName) {
     stream.pipe(writer);
     writer.on('finish', () => {
       const stats = fs.statSync(filePath);
-      resolve({
-        path: filePath,
-        name: finalName,
-        originalName: fileName,
-        size: stats.size,
-        dateDir: formatDate(getCurrentDate())
-      });
+      resolve({ path: filePath, name: finalName, originalName: fileName, size: stats.size, dateDir: formatDate(getCurrentDate()) });
     });
     writer.on('error', reject);
   });
@@ -178,10 +186,7 @@ async function downloadFile(content, fileName) {
 async function sendReply(message, text) {
   try {
     if (message.sessionWebhook) {
-      await axios.post(message.sessionWebhook, {
-        msgtype: 'text',
-        text: { content: text }
-      });
+      await axios.post(message.sessionWebhook, { msgtype: 'text', text: { content: text } });
       console.log('   ✅ 已回复');
       return;
     }
@@ -211,14 +216,11 @@ async function sendReply(message, text) {
 async function handleMessage(message) {
   const isGroup = message.conversationType === '2';
   console.log(`\n📩 ${message.msgtype} | ${isGroup ? '群聊' : '私聊'}`);
-  console.log('   webhook:', message.sessionWebhook ? '有' : '无');
   
-  // 处理文件
   if (message.msgtype === 'file') {
     let content = {};
     let fileName = '未知文件';
     
-    // 解析content
     if (message.content) {
       if (typeof message.content === 'string') {
         try { content = JSON.parse(message.content); } catch {}
@@ -229,7 +231,6 @@ async function handleMessage(message) {
     
     fileName = content.fileName || message.fileName || '未知文件';
     console.log('   文件:', fileName);
-    console.log('   content:', JSON.stringify(content).substring(0, 100));
     
     if (!isAllowedExtension(fileName)) {
       await sendReply(message, '⚠️ 不支持此格式');
@@ -237,7 +238,6 @@ async function handleMessage(message) {
     }
     
     if (!content.downloadCode) {
-      console.log('   ❌ 没有downloadCode');
       await sendReply(message, '❌ 无法获取下载凭证');
       return;
     }
@@ -256,13 +256,12 @@ async function handleMessage(message) {
       await sendReply(message, `❌ 下载失败: ${e.message.substring(0, 50)}`);
     }
   }
-  // 处理文本
   else if (message.msgtype === 'text') {
     const text = (typeof message.text === 'string' ? message.text : message.text?.content || '').trim();
     console.log('   文本:', text);
     
     if (text === '/帮助') {
-      await sendReply(message, '📖 发送文档自动保存\n支持: PDF,Word,Excel,PPT,TXT\n\n命令: /状态 /列表');
+      await sendReply(message, '📖 发送文档自动保存\n支持: PDF,Word,Excel,PPT,TXT,MD\n\n命令: /状态 /列表');
     }
     else if (text === '/状态') {
       const logs = loadLog().filter(l => l.type === 'file');
@@ -278,21 +277,66 @@ async function handleMessage(message) {
   }
 }
 
-// ============ Webhook ============
+// ============ Webhook 回调 ============
 
 app.get('/webhook', (req, res) => {
   console.log('🔔 回调验证');
-  res.send(req.query.echostr);
+  
+  const { signature, timestamp, nonce, echostr } = req.query;
+  
+  // 验证签名
+  const mySignature = signature(botConfig.token, timestamp, nonce, echostr);
+  
+  if (mySignature !== signature) {
+    console.log('❌ 签名验证失败');
+    return res.status(403).send('签名验证失败');
+  }
+  
+  // 解密
+  const decryptStr = decrypt(echostr, botConfig.aesKey);
+  console.log('✅ 解密成功:', decryptStr);
+  
+  res.send(decryptStr);
 });
 
 app.post('/webhook', async (req, res) => {
   res.send('success');
+  
   try {
-    await handleMessage(req.body);
+    const { signature, timestamp, nonce, msg_signature } = req.query;
+    const encrypt = req.body.encrypt;
+    
+    console.log('📨 收到加密消息');
+    
+    // 验证签名
+    const mySignature = signature(botConfig.token, timestamp, nonce, encrypt);
+    
+    if (mySignature !== signature) {
+      console.log('❌ 签名验证失败');
+      return;
+    }
+    
+    // 解密
+    const decryptStr = decrypt(encrypt, botConfig.aesKey);
+    console.log('📝 解密后:', decryptStr.substring(0, 200));
+    
+    // 解析JSON
+    let message;
+    try {
+      message = JSON.parse(decryptStr);
+    } catch {
+      console.log('❌ 解析失败');
+      return;
+    }
+    
+    await handleMessage(message);
+    
   } catch (e) {
-    console.error('❌ 错误:', e.message);
+    console.error('❌ 处理错误:', e.message);
   }
 });
+
+// ============ 健康检查 ============
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
@@ -300,6 +344,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(botConfig.port, '0.0.0.0', () => {
   console.log(`\n🤖 ${botConfig.name} 启动 | 端口: ${botConfig.port}\n`);
+  console.log(`📝 Token: ${botConfig.token}`);
+  console.log(`🔑 AES Key: ${botConfig.aesKey.substring(0, 10)}...\n`);
 });
 
 module.exports = app;
