@@ -209,11 +209,14 @@ const client = new DWClient({
 });
 
 const onEventReceived = (event) => {
-  console.log('📨 收到事件:', event.headers?.topic);
+  console.log('📨 收到事件完整:', JSON.stringify(event).substring(0, 300));
+  console.log('   Headers:', JSON.stringify(event.headers));
   
   try {
     if (event.headers?.topic === 'im.message.receive' || event.headers?.eventType === 'im.message.receive') {
       let content;
+      
+      console.log('   Data:', event.data);
       
       if (typeof event.data === 'string') {
         try {
@@ -225,11 +228,18 @@ const onEventReceived = (event) => {
         content = event.data;
       }
       
+      console.log('   解析后:', JSON.stringify(content).substring(0, 200));
       console.log('   消息类型:', content?.msgtype);
+      console.log('   conversationId:', content?.conversationId);
+      console.log('   conversationType:', content?.conversationType);
       
       if (content && content.msgtype) {
         onMessage(content);
+      } else {
+        console.log('   ⚠️ 消息格式不对，跳过');
       }
+    } else {
+      console.log('   ⚠️ 非消息事件:', event.headers?.topic);
     }
   } catch (e) {
     console.log('   解析错误:', e.message);
@@ -239,6 +249,7 @@ const onEventReceived = (event) => {
 };
 
 function connect() {
+  console.log('🔄 正在连接 Stream...');
   client
     .registerAllEventListener(onEventReceived)
     .connect()
