@@ -274,10 +274,21 @@ function getAllowedFormatsList() {
  * 处理文件消息
  */
 async function handleFileMessage(message, accessToken) {
+  if (!message.file) {
+    console.log('\n⚠️ 消息包含 file 类型但无文件信息');
+    console.log('完整消息:', JSON.stringify(message, null, 2));
+    return;
+  }
+  
   const fileId = message.file.fileId;
   const fileName = message.file.fileName || 'unknown_file';
   
-  console.log(`📥 收到文档: ${fileName}`);
+  console.log('\n========== 收到文件 ==========');
+  console.log('文件名:', fileName);
+  console.log('文件ID:', fileId);
+  console.log('会话ID:', message.conversationId);
+  console.log('发送者ID:', message.senderId);
+  console.log('=============================\n');
   
   // 验证格式
   if (!isAllowedExtension(fileName)) {
@@ -446,6 +457,13 @@ app.post('/webhook', async (req, res) => {
   const message = req.body;
   
   console.log('\n========== 收到钉钉消息 ==========');
+  console.log('消息类型:', message.msgtype || 'unknown');
+  console.log('所有字段:', Object.keys(message));
+  console.log('会话ID:', message.conversationId || message.openConversationId || 'N/A');
+  console.log('发送者ID:', message.senderId || message.userId || 'N/A');
+  console.log('群聊类型:', message.chatType || message.conversationType || 'N/A');
+  console.log('完整消息:', JSON.stringify(message, null, 2));
+  console.log('===================================\n');
   
   // 返回成功响应
   res.send('success');
