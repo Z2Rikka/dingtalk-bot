@@ -1,11 +1,9 @@
 /**
  * 钉钉文档收集机器人
- * 功能：监听群消息/私聊，下载文档到服务器
+ * 功能：监听群消息/私聊，下载文档到Linux服务器
  * 按日期（YYYYMMDD）存储，UTC+8时区
  * 只接受常见文档格式
  */
-
-require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
@@ -130,7 +128,6 @@ function getExtension(fileName) {
  * 生成安全文件名
  */
 function sanitizeFileName(fileName) {
-  // 限制文件名长度
   const maxLen = config.storage.maxFileNameLength;
   let safeName = fileName;
   
@@ -170,35 +167,33 @@ function getDateDir() {
 }
 
 /**
- * 验证并返回目标存储路径
+ * 获取目标存储路径
  */
 function getStoragePath(fileName) {
-  // 检查扩展名
   if (!isAllowedExtension(fileName)) {
     throw new Error(`不支持的格式: ${getExtension(fileName)}`);
   }
   
-  // 获取日期目录
   const dateDir = getDateDir();
-  
-  // 生成唯一文件名
   const uniqueName = generateFileName(fileName);
   
   return path.join(dateDir, uniqueName);
 }
 
 /**
- * 下载钉钉文件
+ * 使用 downloadCode 下载文件
  */
-async function downloadFile(fileId, fileName, accessToken) {
-  const url = `https://api.dingtalk.com/v1.0/robot/file/download?robotId=${config.bot.agentId}&fileId=${fileId}`;
+async function downloadFileWithCode(downloadCode, fileName, accessToken) {
+  const url = 'https://api.dingtalk.com/v1.0/robot/message/files/downloadByTmpCode';
   
-  const response = await axios.get(url, {
+  const response = await axios.post(url, {
+    tmpCode: downloadCode
+  }, {
     headers: { 
-      'x-acs-dingtalk-access-token': accessToken 
+      'x-acs-dingtalk-access-token': accessToken,
+      'Content-Type': 'application/json'
     },
-    responseType: 'stream',
-    timeout: 300000 // 5分钟超时
+    responseType: 'stream'
   });
   
   // 验证文件格式
@@ -229,36 +224,25 @@ async function downloadFile(fileId, fileName, accessToken) {
 /**
  * 发送消息到群/私聊
  */
-async function sendMessage(targetId, targetType, content, sessionWebhook) {
+async function sendMessage(targetId, targetType, content) {
   if (!config.message.autoReply) return;
   
   try {
     const accessToken = await getAccessToken();
     let url;
-    let requestBody;
     
-    if (sessionWebhook) {
-      url = sessionWebhook.trim();
-      requestBody = { msgtype: 'text', text: { content } };
-    } else if (targetType === 'group') {
+    if (targetType === 'group') {
       url = `https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend`;
-      requestBody = {
-        robotId: config.bot.agentId,
-        openConversationId: targetId,
-        msgtype: 'text',
-        text: { content }
-      };
     } else {
       url = `https://api.dingtalk.com/v1.0/robot/oToMessages/send`;
-      requestBody = {
-        robotId: config.bot.agentId,
-        openConversationId: targetId,
-        msgtype: 'text',
-        text: { content }
-      };
     }
     
-    await axios.post(url, requestBody, {
+    await axios.post(url, {
+      robotId: config.bot.agentId,
+      openConversationId: targetId,
+      msgtype: 'text',
+      text: { content }
+    }, {
       headers: { 'x-acs-dingtalk-access-token': accessToken }
     });
   } catch (error) {
@@ -284,23 +268,16 @@ function getAllowedFormatsList() {
 /**
  * 处理文件消息
  */
-async function handleFileMessage(message, accessToken, chatType, sessionWebhook) {
+async function handleFileMessage(message, accessToken) {
+  // 解析文件信息（从 content 中获取）
   const content = message.content || {};
-  const fileId = content.fileId || content.fileID;
-  const fileName = content.fileName || 'unknown_file';
+  const fileId = content.fileId || message.fileId;
+  const fileName = content.fileName || message.fileName || 'unknown_file';
+  const downloadCode = content.downloadCode;
   
-  if (!fileId) {
-    console.log('\n⚠️ 消息包含 file 类型但无文件信息');
-    console.log('完整消息:', JSON.stringify(message, null, 2));
-    return;
-  }
-  
-  console.log('\n========== 收到文件 ==========');
-  console.log('文件名:', fileName);
-  console.log('文件ID:', fileId);
-  console.log('会话ID:', message.conversationId);
-  console.log('发送者ID:', message.senderId);
-  console.log('=============================\n');
+  console.log(`📥 收到文档: ${fileName}`);
+  console.log(`   fileId: ${fileId}`);
+  console.log(`   downloadCode: ${downloadCode ? '有' : '无'}`);
   
   // 验证格式
   if (!isAllowedExtension(fileName)) {
@@ -311,26 +288,30 @@ async function handleFileMessage(message, accessToken, chatType, sessionWebhook)
     
     console.log(`❌ 不支持的格式: ${getExtension(fileName)}`);
     
-    await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
+    await sendMessage(message.conversationId, message.conversationType === '2' ? 'group' : 'private', reply);
     
-    // 记录日志
     addLog({
       type: 'rejected',
       reason: 'unsupported_format',
-      fileId: fileId,
       originalName: fileName,
       extension: getExtension(fileName),
       conversationId: message.conversationId,
       senderId: message.senderId,
-      senderNick: message.senderNick,
-      chatType: message.chatType
+      senderNick: message.senderNick
     });
     
     return null;
   }
   
+  // 使用 downloadCode 下载
+  if (!downloadCode) {
+    console.log('❌ 没有 downloadCode，无法下载');
+    await sendMessage(message.conversationId, message.conversationType === '2' ? 'group' : 'private', '❌ 文件下载失败：无法获取下载凭证');
+    return null;
+  }
+  
   // 下载文件
-  const result = await downloadFile(fileId, fileName, accessToken);
+  const result = await downloadFileWithCode(downloadCode, fileName, accessToken);
   const fileSizeMB = (result.size / 1024 / 1024).toFixed(2);
   
   console.log(`✅ 文档保存成功:`);
@@ -353,7 +334,7 @@ async function handleFileMessage(message, accessToken, chatType, sessionWebhook)
     conversationId: message.conversationId,
     senderId: message.senderId,
     senderNick: message.senderNick,
-    chatType: message.chatType
+    conversationType: message.conversationType
   });
   
   // 发送确认消息
@@ -363,7 +344,8 @@ async function handleFileMessage(message, accessToken, chatType, sessionWebhook)
     .replace('{date}', result.dateDir)
     .replace('{filepath}', result.path);
   
-  await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
+  const targetType = message.conversationType === '2' ? 'group' : 'private';
+  await sendMessage(message.conversationId, targetType, reply);
   
   return result;
 }
@@ -372,86 +354,56 @@ async function handleFileMessage(message, accessToken, chatType, sessionWebhook)
  * 消息处理入口
  */
 async function handleMessage(message) {
-  const sessionWebhook = message.sessionWebhook;
-  const conversationType = message.conversationType;
-  const chatType = conversationType === '1' ? 'group' : 'private';
-  
   console.log(`\n📩 收到消息:`);
   console.log(`   类型: ${message.msgtype}`);
-  console.log(`   会话: ${chatType}`);
+  console.log(`   会话类型: ${message.conversationType} (1=私聊, 2=群聊)`);
+  console.log(`   会话ID: ${message.conversationId}`);
   console.log(`   发送者: ${message.senderNick || message.senderId}`);
   
   const accessToken = await getAccessToken();
   
   // 只处理文件消息
   if (message.msgtype === 'file') {
-    return await handleFileMessage(message, accessToken, chatType, sessionWebhook);
+    return await handleFileMessage(message, accessToken);
   }
   else if (message.msgtype === 'text') {
-    // 处理文本命令
-    const text = message.text.content.trim();
+    const text = message.text.content || message.text || '';
     console.log(`   文本内容: ${text}`);
+    
+    const targetType = message.conversationType === '2' ? 'group' : 'private';
     
     // 帮助命令
     if (text === '/帮助' || text === '/help') {
-      const helpMsg = `📖 文档收集助手\n\n` +
-        `发送文档自动保存到服务器\n\n` +
-        `支持格式：PDF, Word, Excel, PPT, TXT, RAR, ZIP\n\n` +
-        `命令：\n` +
-        `• /状态 - 收集统计\n` +
-        `• /列表 - 最近文件\n` +
-        `• /目录 - 存储目录\n` +
-        `• /帮助 - 显示帮助`;
-      
-      await sendMessage(message.conversationId, chatType, helpMsg, sessionWebhook);
+      const helpMsg = `📖 文档收集助手\n\n发送文档自动保存到服务器\n支持格式：PDF, Word, Excel, PPT, TXT, RAR, ZIP\n\n命令：\n• /状态 - 收集统计\n• /列表 - 最近文件\n• /目录 - 存储目录\n• /帮助 - 显示帮助`;
+      await sendMessage(message.conversationId, targetType, helpMsg);
     }
     // 状态命令
     else if (text === '/状态' || text === '/stats') {
-      const logs = loadLog();
+      const logs = loadLog().filter(l => l.type === 'file');
       const totalSize = logs.reduce((sum, log) => sum + parseFloat(log.fileSize || 0), 0);
-      const fileCount = logs.filter(l => l.type === 'file').length;
-      
-      const statsMsg = `📊 收集统计\n\n` +
-        `📄 文档总数: ${fileCount} 个\n` +
-        `💾 总大小: ${totalSize.toFixed(2)} MB\n` +
-        `📁 存储目录: ${baseDir}`;
-      
-      await sendMessage(message.conversationId, chatType, statsMsg, sessionWebhook);
+      const statsMsg = `📊 收集统计\n\n文档总数: ${logs.length} 个\n总大小: ${totalSize.toFixed(2)} MB\n存储目录: ${baseDir}`;
+      await sendMessage(message.conversationId, targetType, statsMsg);
     }
     // 列表命令
     else if (text === '/列表' || text === '/list') {
       const logs = loadLog().filter(l => l.type === 'file').slice(0, 10);
       let listMsg = `📋 最近文档:\n\n`;
-      
       logs.forEach((log, i) => {
-        listMsg += `${i+1}. ${log.originalName}\n`;
-        listMsg += `   ${log.fileSize} MB | ${log.dateDir}\n\n`;
+        listMsg += `${i+1}. ${log.originalName}\n${log.fileSize} MB | ${log.dateDir}\n\n`;
       });
-      
-      if (logs.length === 0) {
-        listMsg = '暂无记录';
-      }
-      
-      await sendMessage(message.conversationId, chatType, listMsg, sessionWebhook);
+      if (logs.length === 0) listMsg = '暂无记录';
+      await sendMessage(message.conversationId, targetType, listMsg);
     }
     // 目录命令
     else if (text === '/目录' || text === '/dir') {
       try {
         const dirs = fs.readdirSync(baseDir).filter(d => /^\d{8}$/.test(d)).sort().reverse();
-        const dirMsg = `📁 存储目录结构\n\n` +
-          `基础目录: ${baseDir}\n\n` +
-          `日期目录:\n` +
-          dirs.slice(0, 10).map(d => `• ${d}`).join('\n');
-        
-        await sendMessage(message.conversationId, chatType, dirMsg, sessionWebhook);
+        const dirMsg = `📁 存储目录\n\n基础: ${baseDir}\n\n日期:\n${dirs.slice(0, 10).map(d => '• ' + d).join('\n')}`;
+        await sendMessage(message.conversationId, targetType, dirMsg);
       } catch (e) {
-        await sendMessage(message.conversationId, chatType, `目录错误: ${e.message}`, sessionWebhook);
+        await sendMessage(message.conversationId, targetType, `错误: ${e.message}`);
       }
     }
-  }
-  else {
-    // 忽略其他消息类型（图片、语音等）
-    console.log(`   忽略消息类型: ${message.msgtype}（仅处理文档）`);
   }
 }
 
@@ -473,13 +425,6 @@ app.post('/webhook', async (req, res) => {
   const message = req.body;
   
   console.log('\n========== 收到钉钉消息 ==========');
-  console.log('消息类型:', message.msgtype || 'unknown');
-  console.log('所有字段:', Object.keys(message));
-  console.log('会话ID:', message.conversationId || message.openConversationId || 'N/A');
-  console.log('发送者ID:', message.senderId || message.userId || 'N/A');
-  console.log('群聊类型:', message.chatType || message.conversationType || 'N/A');
-  console.log('完整消息:', JSON.stringify(message, null, 2));
-  console.log('===================================\n');
   
   // 返回成功响应
   res.send('success');
@@ -492,7 +437,8 @@ app.post('/webhook', async (req, res) => {
     
     if (message.conversationId) {
       const reply = config.message.replyTemplates.error.replace('{error}', error.message);
-      await sendMessage(message.conversationId, chatType, reply, sessionWebhook);
+      const targetType = message.conversationType === '2' ? 'group' : 'private';
+      await sendMessage(message.conversationId, targetType, reply);
     }
   }
   
@@ -501,83 +447,39 @@ app.post('/webhook', async (req, res) => {
 
 // ============ API 接口 ============
 
-/**
- * 获取文件列表
- */
 app.get('/api/files', (req, res) => {
   const logs = loadLog().filter(l => l.type === 'file');
-  res.json({
-    total: logs.length,
-    files: logs
-  });
+  res.json({ total: logs.length, files: logs });
 });
 
-/**
- * 获取统计信息
- */
 app.get('/api/stats', (req, res) => {
-  const logs = loadLog();
-  const files = logs.filter(l => l.type === 'file');
-  const totalSize = files.reduce((sum, log) => sum + parseFloat(log.fileSize || 0), 0);
-  
-  // 按日期统计
+  const logs = loadLog().filter(l => l.type === 'file');
+  const totalSize = logs.reduce((sum, log) => sum + parseFloat(log.fileSize || 0), 0);
   const byDate = {};
-  files.forEach(log => {
+  logs.forEach(log => {
     const date = log.dateDir || 'unknown';
     byDate[date] = (byDate[date] || 0) + 1;
   });
-  
-  res.json({
-    totalFiles: files.length,
-    totalSize: totalSize.toFixed(2),
-    byDate: byDate,
-    storageDir: baseDir
-  });
+  res.json({ totalFiles: logs.length, totalSize: totalSize.toFixed(2), byDate, storageDir: baseDir });
 });
 
-/**
- * 获取目录列表
- */
 app.get('/api/dirs', (req, res) => {
   try {
-    const dirs = fs.readdirSync(baseDir)
-      .filter(d => /^\d{8}$/.test(d))
-      .sort()
-      .reverse();
-    
+    const dirs = fs.readdirSync(baseDir).filter(d => /^\d{8}$/.test(d)).sort().reverse();
     const result = {};
     dirs.forEach(dir => {
       const dirPath = path.join(baseDir, dir);
       const files = fs.readdirSync(dirPath);
-      result[dir] = {
-        path: dirPath,
-        count: files.length,
-        totalSize: files.reduce((sum, f) => {
-          try {
-            return sum + fs.statSync(path.join(dirPath, f)).size;
-          } catch { return sum; }
-        }, 0)
-      };
-      result[dir].totalSize = (result[dir].totalSize / 1024 / 1024).toFixed(2) + ' MB';
+      result[dir] = { count: files.length };
     });
-    
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/**
- * 健康检查
- */
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    name: config.bot.name,
-    uptime: process.uptime(),
-    storageDir: baseDir,
-    allowedExtensions: config.storage.allowedExtensions
-  });
+  res.json({ status: 'ok', name: config.bot.name, uptime: process.uptime(), storageDir: baseDir });
 });
 
 // ============ 启动 ============
@@ -591,22 +493,12 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📁 存储目录: ${baseDir}`);
   console.log('========================================');
   console.log('');
-  console.log(`回调地址: http://你的服务器IP:${PORT}/webhook`);
+  console.log('回调地址: http://你的服务器IP:' + PORT + '/webhook');
   console.log('');
-  console.log('支持格式:');
-  console.log('  PDF, Word, Excel, PPT, TXT, CSV, MD, JSON, XML, RAR, ZIP, 7Z');
+  console.log('支持格式: PDF, Word, Excel, PPT, TXT, CSV, MD, JSON, XML, RAR, ZIP, 7Z');
   console.log('');
-  console.log('API接口:');
-  console.log('  GET /api/files   - 文件列表');
-  console.log('  GET /api/stats  - 统计信息');
-  console.log('  GET /api/dirs   - 目录列表');
-  console.log('  GET /health    - 健康检查');
-  console.log('');
-  console.log('命令:');
-  console.log('  /帮助   - 显示帮助');
-  console.log('  /状态   - 收集统计');
-  console.log('  /列表   - 最近文件');
-  console.log('  /目录   - 存储目录');
+  console.log('API: /api/files, /api/stats, /api/dirs, /health');
+  console.log('命令: /帮助, /状态, /列表, /目录');
   console.log('');
 });
 
